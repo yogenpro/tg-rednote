@@ -42,6 +42,16 @@ in Chinese, note-type *values* localised (视频/图文/图集 or video/image/Li
 per-request `cookie`, so the bot never rewrites the sidecar's config. It returns HTTP 200 on
 failure with `data: null` and the reason in `message` — check the body, not the status.
 
+**`rednote.com` is the same site, and the sidecar has never heard of it.** Put a rednote.com
+URL to `POST /xhs/detail` and it answers `提取小红书作品链接失败`; rewrite the host to
+www.xiaohongshu.com and the identical note fetches fine. The *page*, though, serves the same
+`noteData` and the same comments from either domain — verified side by side on one note. So the
+sidecar hop is always normalised, while `page_url_for` keeps the bot's own fetches on whichever
+domain the link arrived on. That is not tidiness: an account lives on one domain or the other
+(international accounts are on rednote.com), a cookie goes with it, and the requests this
+process makes are the ones that meet the walls. Sharing a rednote.com link is therefore what
+makes a rednote.com session apply.
+
 **Resolve short links here, not in the sidecar.** The sidecar's own resolver intermittently
 returns `提取小红书作品链接失败` for `xhslink.com` links that redirect fine from this process.
 `XhsDownloader.resolve()` follows short links with browser headers and hands the sidecar a
@@ -60,9 +70,12 @@ just a token or a timestamp (`ci.xiaohongshu.com/<token>`, `sns-webpic-qc.xhscdn
 mixes families, only the item Telegram names in `failed to send message #N` is blamed: a single
 Ultra-HDR image otherwise condemns the ordinary family it travelled with.
 
-**XHS has two walls, and the second one answers HTTP 200.** `/website-login/error?redirectPath=…`
+**XHS has three wall shapes, and two of them answer HTTP 200.** `/website-login/error?redirectPath=…`
 is the login wall; `/404/sec_<token>?source=xhs_sec_server&originalUrl=…` is its bot check, and
-because it returns 200 with a parseable page, nothing downstream notices — the comment scrape
+rednote.com spells the same check `/404?source=/404/sec_<token>?redirectPath=…` — note the
+second `?`, which leaves the target *not a top-level query parameter at all*, so `parse_qs`
+never sees it. `_unwrap_login_wall` therefore scans the whole URL for either parameter name.
+Because these return 200 with a parseable page, nothing downstream notices — the comment scrape
 just comes back empty and a video's renditions are never found, which reads exactly like a note
 that has neither. Both keep the wanted URL in a query parameter, so `_unwrap_login_wall` handles
 both and `is_wall` names the condition; `enrich` logs `page_walled` rather than returning

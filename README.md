@@ -82,6 +82,12 @@ and paste it in. Pasting the whole Chinese share blurb is fine; the link gets pi
 
 ---
 
+**`rednote.com` links work too.** It is the same site under its international name, and it
+serves the same notes. If your account is on rednote.com rather than xiaohongshu.com, share
+the rednote.com form of a link: the bot's own page fetches follow the domain you shared, so
+that is what makes a rednote.com session apply. (The downloader sidecar only speaks
+xiaohongshu.com, so that hop is rewritten for it either way.)
+
 ## Do you need a cookie?
 
 Probably not. Fresh share links carry an `xsec_token`, which is the least-defended path into a

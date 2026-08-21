@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import logging
 import re
-from urllib.parse import parse_qs, unquote, urlsplit
+from urllib.parse import unquote
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -33,11 +33,18 @@ BROWSER_HEADERS = {
 # CJK punctuation is excluded so pasted share blurbs don't glue trailing
 # characters onto the URL. Both share domains appear in the wild: xhslink.com
 # from the international app, xhslink.cn from the mainland one.
+#
+# rednote.com is the international face of the same site. It serves the very
+# same note pages (verified: identical noteData and comments for one note), and
+# a signed-in session belongs to one domain or the other — so links to it have
+# to be recognised, not ignored.
 _TAIL = r"[^\s\"<>\\^`{|}，。；！？、【】《》]+"
+_NOTE_PATH = r"(?:explore|discovery/item|user/profile)"
 LINK_RE = re.compile(
     r"(?:https?://)?(?:"
     rf"xhslink\.(?:com|cn)/{_TAIL}"
-    rf"|(?:www\.)?xiaohongshu\.(?:com|cn)/(?:explore|discovery/item|user/profile)/{_TAIL}"
+    rf"|(?:www\.)?xiaohongshu\.(?:com|cn)/{_NOTE_PATH}/{_TAIL}"
+    rf"|(?:www\.)?rednote\.com/{_NOTE_PATH}/{_TAIL}"
     r")",
     re.IGNORECASE,
 )
@@ -53,16 +60,21 @@ _SIDECAR_READY_RE = re.compile(
     re.IGNORECASE,
 )
 _LONG_NOTE_RE = re.compile(
-    r"^https?://(?:www\.)?xiaohongshu\.(?:com|cn)/(?:explore|discovery/item|user/profile)/",
+    r"^https?://(?:www\.)?(?:xiaohongshu\.(?:com|cn)|rednote\.com)"
+    r"/(?:explore|discovery/item|user/profile)/",
     re.IGNORECASE,
 )
+# Which domain a link arrived on. The sidecar only knows xiaohongshu.com, so
+# that hop is always rewritten; the bot's own page fetches follow the link the
+# user actually shared, because that is the domain their session is on.
+_REDNOTE_RE = re.compile(r"^https?://(?:www\.)?rednote\.com", re.IGNORECASE)
 _NOTE_ID_RE = re.compile(r"/(?:explore|item)/([0-9a-zA-Z]+)")
 _PROFILE_NOTE_RE = re.compile(r"/user/profile/[0-9a-zA-Z]+/([0-9a-zA-Z]+)")
 # A profile with nothing after it. XHS share sheets produce these from a user's
 # page, and there is no note behind one — worth saying so rather than reporting
 # a generic parse failure.
 _PROFILE_ONLY_RE = re.compile(
-    r"^https?://(?:www\.)?xiaohongshu\.com/user/profile/[0-9a-zA-Z]+/?(?:\?|$)",
+    r"^https?://(?:www\.)?(?:xiaohongshu\.com|rednote\.com)/user/profile/[0-9a-zA-Z]+/?(?:\?|$)",
     re.IGNORECASE,
 )
 
@@ -102,34 +114,63 @@ def cache_key(url: str) -> str:
 
 
 def _normalise_host(url: str) -> str:
-    """Upstream's patterns require exactly www.xiaohongshu.com."""
+    """Upstream's patterns require exactly www.xiaohongshu.com.
+
+    rednote.com is included because the sidecar rejects it outright —
+    `提取小红书作品链接失败` — even though the note behind it fetches perfectly
+    once the domain is rewritten (verified live against XHS-Downloader 2.7).
+    """
     return re.sub(
-        r"^(https?://)(?:www\.)?xiaohongshu\.(?:com|cn)",
+        r"^(https?://)(?:www\.)?(?:xiaohongshu\.(?:com|cn)|rednote\.com)",
         r"\1www.xiaohongshu.com",
         url,
         flags=re.IGNORECASE,
     )
 
 
+def page_url_for(sidecar_url: str, shared: str) -> str:
+    """Where to read the note *page* from.
+
+    Both domains serve the same page, but a cookie belongs to one of them. The
+    sidecar hop is always xiaohongshu.com because that is all it recognises;
+    the requests this process makes follow the domain the link came in on, so
+    a rednote.com account's session applies to a rednote.com link.
+    """
+    if _REDNOTE_RE.match(shared or ""):
+        return re.sub(
+            r"^(https?://)(?:www\.)?xiaohongshu\.com",
+            r"\1www.rednote.com",
+            sidecar_url,
+            flags=re.IGNORECASE,
+        )
+    return sidecar_url
+
+
 # XHS has two ways of saying no, and both keep the URL we asked for in a query
 # parameter: /website-login/error?redirectPath=… for the login wall, and
 # /404/sec_<token>?source=xhs_sec_server&originalUrl=… for its bot check. The
 # second answers HTTP 200, so nothing downstream notices unless it is named.
-_WALLS = (("website-login/error", "redirectPath"), ("/404/sec_", "originalUrl"))
+# Three wall shapes so far: the login wall, the security wall, and the
+# rednote.com spelling of the second. The parameter name differs by domain —
+# `originalUrl` on xiaohongshu.com, `redirectPath` on rednote.com — and
+# rednote nests it inside `?source=/404/sec_X?redirectPath=…`, where it is not
+# a top-level query parameter at all. Scanning the whole URL handles every
+# arrangement; parsing the query only handled two of the three.
+_WALLS = ("website-login/error", "/404/sec_", "/404?source=")
+_WALL_TARGET_RE = re.compile(r"(?:redirectPath|originalUrl)=([^&]+)", re.IGNORECASE)
 
 
 def _unwrap_login_wall(url: str) -> str:
-    """Recover the note URL from whichever wall XHS bounced us to."""
-    for marker, parameter in _WALLS:
-        if marker in url:
-            target = parse_qs(urlsplit(url).query).get(parameter, [""])[0]
-            return unquote(target) if target else url
-    return url
+    """Recover the note URL from whichever wall we were bounced to."""
+    if not is_wall(url):
+        return url
+    match = _WALL_TARGET_RE.search(url)
+    return unquote(match.group(1)) if match else url
 
 
 def is_wall(url: str) -> bool:
     """True when a fetch landed on a wall rather than on the note."""
-    return any(marker in url for marker, _parameter in _WALLS)
+    return any(marker in url for marker in _WALLS)
 
 
 class XhsError(RuntimeError):
@@ -373,7 +414,11 @@ class XhsDownloader:
             return False
 
     async def detail(self, url: str, cookie: str | None = None) -> Note:
+        shared = url
         url = await self.resolve(url)
+        # Where the bot reads the page from, which is not always where the
+        # sidecar is pointed — see page_url_for.
+        page = page_url_for(url, shared)
         if _PROFILE_ONLY_RE.match(url):
             # No point asking the sidecar: there is no note here to fetch.
             raise XhsError("profile", "that link points at a profile, not a note")
@@ -401,7 +446,7 @@ class XhsDownloader:
                 raise XhsError("bad_link", message or "no note link found")
             # The signed API refuses some notes that render perfectly well for
             # an anonymous browser, so try the page before giving up.
-            fallback = await self.from_page(url)
+            fallback = await self.from_page(page)
             if fallback:
                 log.info(
                     "sidecar refused %s (%s); read it off the page instead",
@@ -414,7 +459,7 @@ class XhsDownloader:
             raise XhsError("blocked", message or "no data returned")
 
         note = parse_note(data)
-        note.page_url = url
+        note.page_url = page
         if not note.media("both"):
             raise XhsError("empty", "note contained no downloadable media")
         return note

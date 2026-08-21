@@ -113,6 +113,39 @@ def test_unwrap_login_wall():
     assert _unwrap_login_wall(plain) == plain
 
 
+def test_rednote_com_is_the_same_site_and_must_be_recognised():
+    """The international domain. It serves the identical note page, but the
+    sidecar rejects it outright (提取小红书作品链接失败), so it is normalised for
+    that hop only."""
+    from app.xhs import _normalise_host, find_link, page_url_for
+
+    link = find_link("see https://www.rednote.com/explore/6a8860eb000000003502388c")
+    assert link == "https://www.rednote.com/explore/6a8860eb000000003502388c"
+    assert _normalise_host(link) == (
+        "https://www.xiaohongshu.com/explore/6a8860eb000000003502388c"
+    )
+    assert find_link("rednote.com/discovery/item/650a").startswith("https://rednote.com/")
+
+
+def test_the_page_is_read_from_the_domain_the_link_arrived_on():
+    """A session belongs to one domain. The sidecar hop is always
+    xiaohongshu.com; the bot's own fetches follow the shared link."""
+    from app.xhs import _normalise_host, page_url_for
+
+    shared = "https://www.rednote.com/explore/650a?xsec_token=t"
+    sidecar = _normalise_host(shared)
+    assert page_url_for(sidecar, shared) == "https://www.rednote.com/explore/650a?xsec_token=t"
+
+    plain = "https://www.xiaohongshu.com/explore/650a"
+    assert page_url_for(plain, plain) == plain
+
+
+def test_a_rednote_profile_link_is_still_a_profile():
+    from app.xhs import _PROFILE_ONLY_RE
+
+    assert _PROFILE_ONLY_RE.match("https://www.rednote.com/user/profile/5f2b")
+
+
 def test_unwrap_the_security_wall():
     """XHS's bot check is a second wall shape, and it answers HTTP 200 — so
     nothing downstream notices it unless it is recognised by name."""
@@ -126,6 +159,15 @@ def test_unwrap_the_security_wall():
     assert is_wall(wall)
     assert is_wall("https://www.xiaohongshu.com/website-login/error?redirectPath=x")
     assert not is_wall("https://www.xiaohongshu.com/explore/6a88")
+
+    # rednote.com serves the same wall with the other parameter name, which is
+    # why both are tried rather than pinned to a shape.
+    other = (
+        "https://www.rednote.com/404?source=/404/sec_byOrsOFI"
+        "?redirectPath=http%3A%2F%2Fwww.rednote.com%2Fexplore%2F6a88&error_code=300031"
+    )
+    assert is_wall(other)
+    assert _unwrap_login_wall(other) == "http://www.rednote.com/explore/6a88"
 
 
 def test_cache_key_prefers_note_id():

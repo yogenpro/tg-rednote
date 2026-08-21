@@ -27,6 +27,7 @@ bot/app/
   xhs.py        sidecar client, link parsing/resolution, payload normalisation
   media.py      caption assembly, album chunking, URL-vs-upload delivery
   comments.py   top comments scraped from the note page
+  acres.py      1point3acres threads: link shapes, de-jamming, DM-only delivery
   state.py      atomic 0600 state.json (owner, allowlist, cookie, health)
   telegram.py   raw Bot API client (429 handling, token redaction)
   cache.py      LRU with TTL
@@ -129,6 +130,30 @@ a stable `event` name; `fields(...)` carries structure on a nested key so it can
 together. Alloy turns the lines into Prometheus metrics, so the bot never has to listen on a
 port. Event vocabulary and queries: `OBSERVABILITY.md`. When adding a log line that someone
 might later want to count, give it an `event`.
+
+**1point3acres is a second site, and deliberately unlike the first.** Everything about
+`acres.py` follows from three facts. *Cloudflare runs a managed challenge over the whole
+domain*, so there is no anonymous mode at all — TLS impersonation (curl_cffi, every
+`impersonate` profile) still gets the interstitial, because the challenge wants JavaScript.
+The only way in is the owner's own browser session, which is why `/acres` accepts a **Copy as
+cURL** paste: `cf_clearance` is bound to the User-Agent that solved the challenge, so the UA
+is stored beside the cookie rather than guessed. *The post body is poisoned*: between every
+`<br>` sits a `<font class="jammer">` carrying ". From 1point 3acres bbs", "-baidu
+1point3acres", a lone Greek chi, and `<span style="display:none">` hides more. `to_text` is an
+`HTMLParser` subclass that drops hidden elements wholesale — recognising the payloads is a
+losing game, and the paywall block nests divs, which no regex can unwind. *Pages are GBK.*
+Points-walled text leaves a visible `[…]` rather than being sewn shut, because splicing the
+two halves together reads as the author's own sentence.
+
+**The site is DM-only, and that is enforced in two places.** `_handle_group_message` returns
+before it ever looks for a thread link, and there is no channel path at all — no submission,
+no dedupe, no announcement. Threads are long, often half-paywalled, and the channel is for
+RedNote.
+
+**Two cookies now, and the order they are matched in matters.** A 1point3acres cookie carries
+`_gid=`, and the RedNote matcher accepts anything containing `gid=`, so the forum check runs
+first. `acres.looks_like_cookie` also refuses anything containing `://`: the cookie handler
+*deletes* the message it is given, and an `oss.1p3a.com` image URL would otherwise be eaten.
 
 **CI is one workflow, `.github/workflows/ci.yml`, with two jobs.** `pytest` runs the suite on
 3.12 and 3.13 for every push and pull request — it needs no network, sidecar or Telegram, so a

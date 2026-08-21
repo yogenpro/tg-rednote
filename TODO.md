@@ -1,9 +1,27 @@
 # TODO
 
-Status as of 2026-08-21. Tests: 142 passing. The bot has been exercised live against ~15 real
+Status as of 2026-08-21. Tests: 178 passing. The bot has been exercised live against ~15 real
 notes (images, Ultra-HDR albums, videos, forwarded messages, `.com` and `.cn` links).
 
 ## Open
+
+- [ ] **1point3acres has never fetched a real thread.** Everything is built and unit-tested
+      against real archived markup, and the failure path is confirmed live (the site answers
+      an anonymous request with a Cloudflare managed challenge, as designed). What is untested
+      is the path *with* a cookie: whether `cf_clearance` from the owner's browser gets a
+      200 from this process, whether attachments come back as `zoomfile`/`file` URLs the way
+      the Discuz templates suggest, and whether Telegram will fetch an `oss.1p3a.com` image
+      or has to be handed the bytes. Send `/acres <Copy as cURL>` and a thread link to find
+      out — that is the whole remaining test.
+
+- [ ] **Only the opening post is delivered.** Replies are often where the value is on that
+      forum, and the page already carries them (`postmessage_<pid>` repeats per post). Worth
+      deciding whether a thread should bring back the top few replies the way a note brings
+      back its comments.
+
+- [ ] **No refresh path for an expired forum session.** A stale cookie is detected and the
+      owner is told, but a `cf_clearance` lasts hours to days, so this will be a recurring
+      chore. Nothing automatic is possible without running a browser.
 
 - [ ] **The Alloy config in OBSERVABILITY.md is unverified.** Written from the documented stage
       syntax, never run against a real Alloy. `stage.metrics` in particular has moved between
@@ -43,6 +61,12 @@ notes (images, Ultra-HDR albums, videos, forwarded messages, `.com` and `.cn` li
       spawns a task. Fine for single-digit users, a problem if the allowlist ever grows.
 
 ## Recently done (context for the above)
+
+- 1point3acres: thread links in a DM come back as the opening post, with the site's
+  `<font class="jammer">` interference and zero-width characters stripped, GBK decoded,
+  points-walled gaps marked `[…]`, and its own cookie custody (`/acres`, which accepts a
+  "Copy as cURL" paste so `cf_clearance` keeps the User-Agent it was issued for). DM-only by
+  construction: no group path, no channel path.
 
 - Group listening and dedupe, both confirmed live on 2026-08-21: a real group has been
   publishing submissions silently for a day, and a note resubmitted there by a second user

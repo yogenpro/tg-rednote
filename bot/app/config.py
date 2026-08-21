@@ -61,6 +61,11 @@ class Config:
     # the connection that needs a residential IP, and routing it through a
     # home link would only add latency and a failure mode.
     xhs_proxy: str = ""
+    # 1point3acres threads, DM only. Nothing to configure beyond the browser
+    # User-Agent used when the stored cookie didn't come with one — see
+    # acres.py on why cf_clearance cares.
+    acres: bool = True
+    acres_ua: str = ""
     tags_in_caption: bool = True
     comments: int = 5  # top comments to append; 0 disables the extra page fetch
     debug_updates: bool = False
@@ -91,6 +96,8 @@ class Config:
             poll_timeout=_env_int("POLL_TIMEOUT", 30),
             channel_id=os.environ.get("CHANNEL_ID", "").strip(),
             xhs_proxy=os.environ.get("XHS_PROXY", "").strip(),
+            acres=_env_bool("ACRES", True),
+            acres_ua=os.environ.get("ACRES_UA", "").strip(),
             tags_in_caption=_env_bool("TAGS_IN_CAPTION", True),
             comments=max(0, min(10, _env_int("COMMENTS", 5))),
             debug_updates=_env_bool("DEBUG_UPDATES", False),

@@ -195,6 +195,7 @@ class MediaSender:
         file_ids: LRU[str] | None = None,
         timeout: float = 120.0,
         proxy: str = "",
+        headers: dict[str, str] | None = None,
     ):
         self._tg = telegram
         self._configured_mode = mode
@@ -205,11 +206,23 @@ class MediaSender:
         # The CDN is XHS too: when XHS traffic is routed somewhere specific,
         # media downloads belong on the same path.
         self._client = httpx.AsyncClient(
-            timeout=timeout, follow_redirects=True, headers=CDN_HEADERS, proxy=proxy or None
+            timeout=timeout,
+            follow_redirects=True,
+            headers=headers if headers is not None else CDN_HEADERS,
+            proxy=proxy or None,
         )
 
     async def aclose(self) -> None:
         await self._client.aclose()
+
+    def set_headers(self, **headers: str) -> None:
+        """Update the download headers in place.
+
+        The 1point3acres attachments are served only to a logged-in session, so
+        the sender's cookie has to follow whatever the owner last stored rather
+        than being fixed when the process started.
+        """
+        self._client.headers.update({k: v for k, v in headers.items() if v})
 
     @property
     def streaming(self) -> bool:

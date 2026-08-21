@@ -1,7 +1,7 @@
 """Durable state: one small JSON file on one volume (PLAN §5).
 
-Everything else in the process is disposable. The file holds a secret (the XHS
-cookie), so it is written 0600 and replaced atomically.
+Everything else in the process is disposable. The file holds secrets — the XHS
+cookie and the 1point3acres one — so it is written 0600 and replaced atomically.
 """
 
 from __future__ import annotations
@@ -38,6 +38,14 @@ class State:
         "xhs_cookie": None,
         "cookie_set_at": None,
         "cookie_status": "unset",  # unset | ok | stale
+        # 1point3acres sits behind a Cloudflare managed challenge, so there is
+        # no anonymous mode: the owner's browser cookie is the only way in.
+        # cf_clearance is bound to the User-Agent that solved the challenge,
+        # so the UA is stored with it rather than assumed.
+        "acres_cookie": None,
+        "acres_ua": None,
+        "acres_cookie_set_at": None,
+        "acres_cookie_status": "unset",  # unset | ok | stale
         "last_successful_fetch": None,
         # note_id -> {"chat": str, "message_id": int, "at": iso}. Keeps a
         # resubmitted link from posting to the channel twice.
@@ -91,6 +99,18 @@ class State:
     @property
     def cookie_status(self) -> str:
         return self.data.get("cookie_status") or "unset"
+
+    @property
+    def acres_cookie(self) -> str | None:
+        return self.data.get("acres_cookie") or None
+
+    @property
+    def acres_ua(self) -> str | None:
+        return self.data.get("acres_ua") or None
+
+    @property
+    def acres_cookie_status(self) -> str:
+        return self.data.get("acres_cookie_status") or "unset"
 
     def is_allowed(self, user_id: int) -> bool:
         return user_id in self.allowlist
@@ -160,6 +180,33 @@ class State:
         self.data["cookie_status"] = "stale"
         self.save()
         return True
+
+    def set_acres_cookie(self, cookie: str, user_agent: str = "") -> None:
+        self.data["acres_cookie"] = cookie
+        self.data["acres_ua"] = user_agent or None
+        self.data["acres_cookie_set_at"] = utcnow()
+        self.data["acres_cookie_status"] = "ok"
+        self.save()
+
+    def clear_acres_cookie(self) -> None:
+        self.data["acres_cookie"] = None
+        self.data["acres_ua"] = None
+        self.data["acres_cookie_set_at"] = None
+        self.data["acres_cookie_status"] = "unset"
+        self.save()
+
+    def mark_acres_cookie_stale(self) -> bool:
+        """True only on the transition, so the owner is told once."""
+        if self.acres_cookie_status == "stale":
+            return False
+        self.data["acres_cookie_status"] = "stale"
+        self.save()
+        return True
+
+    def mark_acres_success(self) -> None:
+        if self.acres_cookie and self.acres_cookie_status != "ok":
+            self.data["acres_cookie_status"] = "ok"
+            self.save()
 
     PUBLISHED_LIMIT = 1000
 

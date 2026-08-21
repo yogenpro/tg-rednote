@@ -10,6 +10,9 @@ The bot first offers Telegram the XHS CDN URLs so Telegram does the fetching; wh
 refuses those (it does — see below), it transparently streams the bytes through instead,
 in memory, and never writes them to disk.
 
+It also reads [1point3acres](https://www.1point3acres.com) threads, in DMs only — see
+[1point3acres threads](#1point3acres-threads).
+
 Design rationale for all of this lives in [PLAN.md](PLAN.md); this file is how to run it.
 
 ---
@@ -112,8 +115,42 @@ logged.
 | `/status` | allowlist | Cookie age and health, last successful fetch, sidecar reachability, cache stats |
 | `/cookie <value>` | owner | Store the XHS cookie; the message is deleted on receipt |
 | `/forgetcookie` | owner | Wipe the stored cookie |
+| `/acres <cookie or cURL>` | owner | Store the 1point3acres session; the message is deleted on receipt |
+| `/forgetacres` | owner | Wipe the stored 1point3acres session |
 | `/allow <user_id>` · `/deny <user_id>` · `/users` | owner | Manage the allowlist |
 | `/help` | allowlist | Usage |
+
+### 1point3acres threads
+
+A link to a [1point3acres](https://www.1point3acres.com) thread — any of `/home/thread/<id>`,
+`/interview/thread/<id>` or the old `/bbs/thread-<id>-1-1.html` — comes back as the opening
+post: title, author, the text, and any images the post carries.
+
+**This works in a DM and nowhere else.** A thread link posted in a watched group is ignored,
+and nothing is ever published to the channel. Forum posts are long, frequently half-hidden
+behind the site's points wall, and a channel of them is not what channel mode is for.
+
+The site runs a Cloudflare managed challenge across the whole domain, so unlike RedNote there
+is no anonymous mode — it needs your browser's session before it will fetch anything:
+
+1. Open any thread in a logged-in browser.
+2. DevTools → Network → the document request → right-click → **Copy as cURL**.
+3. Send the bot `/acres <paste>`.
+
+Paste the whole cURL rather than just the cookie: Cloudflare ties `cf_clearance` to the exact
+User-Agent that solved the challenge, so the bot stores the UA alongside the cookie. A bare
+`Cookie` header works too if your browser is a recent Chrome, but a mismatch shows up as a
+challenge that looks like a bad cookie. Like the RedNote cookie, the message is deleted on
+receipt and the value is stored 0600 and never logged.
+
+`cf_clearance` is also tied to the IP that earned it, so the browser and the bot want to be on
+the same connection. Sessions expire; `/status` shows when the stored one last worked, and a
+failed fetch marks it stale and tells the owner.
+
+The site sprays anti-copy junk through every post — hidden `<font class="jammer">` elements
+carrying strings like ". From 1point 3acres bbs", plus zero-width characters. None of it
+reaches the message. Text hidden behind the points wall is marked `[…]` where it was, rather
+than being quietly stitched over.
 
 ### Channel mode
 
@@ -231,6 +268,8 @@ Everything except the token has a working default.
 | `DEBUG_UPDATES` | `false` | Dumps every incoming update, message text included. Diagnostics only — a mistyped cookie would land in the log. |
 | `CHANNEL_ID` | unset | `@name` or `-100…`. Set it to run in channel mode — see below. |
 | `COMMENTS` | `5` | Top comments (with their replies) posted as a follow-up message. `0` disables the extra page fetch. |
+| `ACRES` | `true` | 1point3acres thread links, DM only. `false` turns the feature off entirely. |
+| `ACRES_UA` | unset | Fallback User-Agent for a stored 1point3acres cookie that arrived without one. |
 
 `/status` shows which media path is live: *CDN URL passthrough* means zero bytes moved through
 your machine; *streaming through the bot* means at least one CDN family was refused and is being

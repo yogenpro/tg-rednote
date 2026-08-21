@@ -81,6 +81,9 @@ class FakeSender:
             parts=[(self.next_message_id, caption)],
         )
 
+    def set_headers(self, **headers):
+        self.headers = dict(headers)
+
     async def aclose(self):
         return None
 

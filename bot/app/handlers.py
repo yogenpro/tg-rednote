@@ -10,6 +10,16 @@ import time
 from datetime import datetime, timezone
 from html import escape
 
+from .acres import (
+    Acres,
+    AcresError,
+    Thread,
+    find_acres_link,
+    parse_credentials,
+    render as render_thread,
+    thread_id,
+)
+from .acres import looks_like_cookie as looks_like_acres_cookie
 from .cache import LRU
 from .config import Config
 from .logs import current_rid, fields, new_rid
@@ -17,7 +27,7 @@ from .comments import fit_into_caption, render_comments, strip_tags
 from .media import MEDIA_GROUP_LIMIT, MediaSender, build_caption, split_message, tg_len
 from .state import State, generate_pairing_code
 from .telegram import CAPTION_LIMIT, MESSAGE_LIMIT, Telegram, TelegramError
-from .xhs import Note, XhsDownloader, XhsError, cache_key, find_link
+from .xhs import MediaItem, Note, XhsDownloader, XhsError, cache_key, find_link
 
 log = logging.getLogger(__name__)
 
@@ -33,6 +43,9 @@ HELP = """<b>RedNote → Telegram</b>
 
 Send me a Xiaohongshu share link and I'll post the note back as native media.
 
+A <b>1point3acres</b> thread link works here too — in this chat only — and comes \
+back as text with whatever images the post carries.
+
 /status — cookie age, last successful fetch, sidecar health
 /cookie &lt;value&gt; — set the XHS cookie (the message is deleted on receipt)
 /forgetcookie — wipe the stored cookie
@@ -42,12 +55,25 @@ OWNER_HELP = HELP + """
 
 <b>Owner only</b>
 /allow &lt;user_id&gt; · /deny &lt;user_id&gt; · /users
-/groups · /allowgroup &lt;chat_id&gt; · /denygroup &lt;chat_id&gt;"""
+/groups · /allowgroup &lt;chat_id&gt; · /denygroup &lt;chat_id&gt;
+/acres &lt;cookie or curl&gt; · /forgetacres"""
 
 # Shown at the foot of a message that has a continuation. Kept short: it costs
 # caption room, which the note's own text would rather have.
 CONTINUED = "continues ↓"
 CONTINUED_COST = 16  # the text, plus the blank line before it
+
+ACRES_INSTRUCTIONS = (
+    "1point3acres sits behind a Cloudflare challenge, so I need your browser's "
+    "own session.\n\nOpen a thread in a logged-in browser → DevTools → Network → "
+    "the document request → right-click → <b>Copy as cURL</b>, then send it here "
+    "as <code>/acres &lt;paste&gt;</code>.\n\nPasting the whole cURL matters: "
+    "Cloudflare ties <code>cf_clearance</code> to the exact User-Agent that "
+    "solved the challenge, and the paste carries both. A bare "
+    "<code>Cookie</code> header works too if the browser is a recent Chrome.\n\n"
+    "Same caveat as the RedNote cookie: I delete the message on receipt, but it "
+    "has already transited Telegram's servers."
+)
 
 COOKIE_INSTRUCTIONS = (
     "Open <b>xiaohongshu.com</b> in a logged-in browser → DevTools → "
@@ -122,6 +148,21 @@ class Bot:
             file_ids=self.file_ids,
             proxy=config.xhs_proxy,
         )
+        # 1point3acres: its own client, cache and sender. The sender needs
+        # separate headers — the forum serves attachments only to a logged-in
+        # session, and the XHS proxy has no business carrying this traffic.
+        self.acres: Acres | None = None
+        self.acres_sender: MediaSender | None = None
+        self.threads: LRU[Thread] = LRU(maxsize=config.cache_size, ttl=config.cache_ttl_seconds)
+        if config.acres:
+            self.acres = Acres(timeout=config.fetch_timeout, user_agent=config.acres_ua)
+            self.acres_sender = MediaSender(
+                telegram,
+                mode=config.media_mode,
+                max_bytes=config.max_upload_bytes,
+                file_ids=self.file_ids,
+                headers=self.acres.headers(state.acres_cookie, state.acres_ua),
+            )
         self.pairing_code: str | None = None
         self.started_at = time.monotonic()
         self._refused: set[int] = set()
@@ -188,10 +229,12 @@ class Bot:
         chat_id = chat.get("id")
         if not self.state.listens_in(chat_id):
             return
-        link = next(
-            (found for found in map(find_link, message_candidates(message)) if found), None
-        )
+        candidates = message_candidates(message)
+        link = next((found for found in map(find_link, candidates) if found), None)
         if not link:
+            # 1point3acres is deliberately DM-only: threads are long, often
+            # partly paywalled, and the channel is for RedNote. A link to one
+            # here is ignored in silence like anything else.
             return
         if not self.channel:
             log.info("ignoring a link from %s: no channel configured", chat.get("title"))
@@ -336,6 +379,16 @@ class Bot:
             return
 
         # Cookie first: a bare paste must be recognised before anything logs it.
+        # Two sites now, so the markers have to be tried in order: a
+        # 1point3acres cookie carries `_gid=`, and the RedNote matcher would
+        # otherwise claim it on the strength of "gid=".
+        if (
+            text.startswith("/acres")
+            or text.lower().startswith("curl ")
+            or looks_like_acres_cookie(text)
+        ):
+            await self._handle_acres_cookie(chat_id, user_id, message.get("message_id"), text)
+            return
         if text.startswith("/cookie") or looks_like_cookie(text):
             await self._handle_cookie(chat_id, user_id, message.get("message_id"), text)
             return
@@ -351,6 +404,19 @@ class Bot:
             self.state.clear_cookie()
             await self._reply(chat_id, "Cookie wiped. Fetches will run unauthenticated.")
             return
+        if command == "/forgetacres":
+            if user_id != self.state.owner_id:
+                await self._reply(chat_id, "Owner only.")
+                return
+            self.state.clear_acres_cookie()
+            if self.acres_sender:
+                self.acres_sender.set_headers(Cookie="")
+            await self._reply(
+                chat_id,
+                "1point3acres cookie wiped. Threads will fail at the Cloudflare "
+                "challenge until a new one is set.",
+            )
+            return
         if command in ("/allow", "/deny", "/users"):
             await self._handle_admin(chat_id, user_id, command, text)
             return
@@ -359,6 +425,7 @@ class Bot:
             return
 
         link = next((found for found in map(find_link, candidates) if found), None)
+        thread = next((found for found in map(find_acres_link, candidates) if found), None)
         # Never log message text: a mistyped cookie would end up in the log.
         log.info(
             "message %s from %s: %d chars, %d candidate(s), link=%s",
@@ -366,11 +433,24 @@ class Bot:
             user_id,
             len(text),
             len(candidates),
-            link or "none",
+            link or thread or "none",
         )
         if self.config.debug_updates:
             log.info("update dump: %s", json.dumps(message, ensure_ascii=False)[:2000])
 
+        if thread and not link:
+            if not self.acres:
+                await self._reply(chat_id, "1point3acres support is switched off here.")
+                return
+            current_rid.set(new_rid())
+            log.info(
+                "submission from %s", user_id,
+                extra=fields(event="submission", source="dm", site="1p3a"),
+            )
+            await self._handle_acres_link(
+                chat_id, message.get("message_id"), thread, user_id
+            )
+            return
         if link:
             current_rid.set(new_rid())
             log.info("submission from %s", user_id, extra=fields(event="submission", source="dm"))
@@ -437,6 +517,207 @@ class Bot:
             chat_id,
             f"Cookie stored ({len(value)} chars) and marked healthy.{note}",
         )
+
+    async def _handle_acres_cookie(
+        self, chat_id: int, user_id: int, message_id: int | None, text: str
+    ) -> None:
+        # Delete first: the value is on Telegram's servers until we do (PLAN §7).
+        deleted = await self.tg.delete_message(chat_id, message_id) if message_id else False
+
+        if user_id != self.state.owner_id:
+            await self._reply(chat_id, "Only the owner can set the 1point3acres cookie.")
+            return
+        if not self.acres:
+            await self._reply(chat_id, "1point3acres support is switched off here.")
+            return
+
+        value = text.split(None, 1)[1].strip() if text.startswith("/acres") and " " in text else text
+        cookie, user_agent = parse_credentials(value)
+        if not cookie or not looks_like_acres_cookie(cookie):
+            await self._reply(
+                chat_id,
+                "I couldn't find a 1point3acres session in that (no "
+                "<code>cf_clearance</code> or forum auth cookie).\n\n" + ACRES_INSTRUCTIONS,
+            )
+            return
+
+        self.state.set_acres_cookie(cookie, user_agent)
+        if self.acres_sender:
+            self.acres_sender.set_headers(**self.acres.headers(cookie, user_agent))
+        warnings = []
+        if not deleted:
+            warnings.append("⚠️ I could not delete your message — delete it manually.")
+        if not user_agent:
+            # Without the browser's own UA the Cloudflare pass is a coin flip,
+            # and the failure looks like "the cookie is wrong" instead.
+            warnings.append(
+                "⚠️ No User-Agent came with that, so I'll use a default one. If threads "
+                "come back as a Cloudflare challenge, resend it as a <b>Copy as cURL</b> "
+                "paste — <code>cf_clearance</code> only works for the browser that earned it."
+            )
+        await self._reply(
+            chat_id,
+            f"1point3acres cookie stored ({len(cookie)} chars"
+            + (", with its User-Agent" if user_agent else "")
+            + ")." + ("\n\n" + "\n\n".join(warnings) if warnings else ""),
+        )
+
+    async def _handle_acres_link(
+        self, chat_id: int, message_id: int | None, link: str, user_id: int | None = None
+    ) -> None:
+        """Fetch a forum thread and deliver it to the DM it came from.
+
+        Unlike the note flow this never touches the channel: the site is
+        DM-only, so there is no submission, no dedupe and no announcement.
+        """
+        started = time.monotonic()
+        key = thread_id(link) or link
+        thread = self.threads.get(key)
+        cached = thread is not None
+        if thread is None:
+            async with self._busy(chat_id, "typing"):
+                try:
+                    thread = await self.acres.thread(
+                        link, self.state.acres_cookie, self.state.acres_ua
+                    )
+                except AcresError as exc:
+                    await self._handle_acres_error(chat_id, message_id, exc, user_id)
+                    return
+            self.state.mark_acres_success()
+            self.threads.put(key, thread)
+
+        items = [MediaItem("photo", url) for url in thread.images]
+        log.info(
+            "thread %s: %d char(s), %d image(s)%s, requested by %s",
+            thread.tid or "?",
+            len(thread.body),
+            len(items),
+            " [cached]" if cached else "",
+            user_id or chat_id or "?",
+            extra=fields(
+                event="note",
+                site="1p3a",
+                note=thread.tid,
+                kind="thread",
+                items=len(items),
+                cached=cached,
+                locked=thread.locked or thread.needs_login,
+            ),
+        )
+
+        # No images means no album, and then the first message is a message
+        # rather than a caption — four times the room for the post's text.
+        parts = -(-len(items) // MEDIA_GROUP_LIMIT) if items else 0
+        marker = len(f"[{parts}/{parts}] ") if parts > 1 else 0
+        head, overflow = render_thread(
+            thread, limit=CAPTION_LIMIT if items else MESSAGE_LIMIT, reserve=marker
+        )
+
+        previous: int | None = None
+        if items:
+            action = "upload_photo"
+            try:
+                async with self._busy(chat_id, action):
+                    report = await self.acres_sender.send(
+                        chat_id, items, head, reply_to=message_id
+                    )
+            except TelegramError as exc:
+                log.exception("send failed for thread %s", thread.tid)
+                await self._reply(
+                    chat_id,
+                    "Telegram refused the images: " + f"<code>{escape(exc.description)}</code>",
+                    reply_to=message_id,
+                )
+                report = None
+            if report and report.sent:
+                previous = report.first_message_id
+                if report.skipped:
+                    log.warning(
+                        "thread %s skipped %s", thread.tid or "?", "; ".join(report.skipped),
+                        extra=fields(
+                            event="media_skipped", site="1p3a", note=thread.tid,
+                            count=len(report.skipped),
+                        ),
+                    )
+            else:
+                # The text is the point of a forum post; images failing must not
+                # take it down with them.
+                previous = await self._send_and_track(chat_id, head, reply_to=message_id)
+        else:
+            previous = await self._send_and_track(chat_id, head, reply_to=message_id)
+
+        for piece in split_message(overflow, MESSAGE_LIMIT):
+            sent = await self._send_and_track(chat_id, escape(piece), reply_to=previous)
+            previous = sent or previous
+
+        log.info(
+            "delivered thread %s in %.1fs",
+            thread.tid or "?",
+            time.monotonic() - started,
+            extra=fields(
+                event="delivery",
+                site="1p3a",
+                note=thread.tid,
+                items=len(items),
+                seconds=round(time.monotonic() - started, 1),
+            ),
+        )
+
+    async def _handle_acres_error(
+        self, chat_id: int, message_id: int | None, exc: AcresError, user_id: int | None = None
+    ) -> None:
+        log.warning(
+            "1point3acres fetch failed (%s): %s", exc.kind, exc,
+            extra=fields(event="fetch_failed", site="1p3a", kind=exc.kind, detail=str(exc)[:200]),
+        )
+        if exc.kind == "bad_link":
+            await self._reply(
+                chat_id, "I couldn't read a thread id out of that.", reply_to=message_id
+            )
+            return
+        if exc.kind == "network":
+            await self._reply(
+                chat_id, "1point3acres isn't answering. Try again shortly.", reply_to=message_id
+            )
+            return
+        if exc.kind == "empty":
+            await self._reply(
+                chat_id,
+                "That thread's opening post has nothing I can send.",
+                reply_to=message_id,
+            )
+            return
+
+        # "challenge" or "login": both mean the stored session no longer works,
+        # and both are fixed the same way.
+        wall = (
+            "Cloudflare answered with a challenge instead of the thread."
+            if exc.kind == "challenge"
+            else "The forum served a login notice instead of the thread."
+        )
+        if user_id == self.state.owner_id:
+            await self._reply(
+                chat_id,
+                f"{wall} "
+                + (
+                    "The stored cookie has expired or was earned by a different browser.\n\n"
+                    if self.state.acres_cookie
+                    else "I have no 1point3acres cookie stored.\n\n"
+                )
+                + ACRES_INSTRUCTIONS,
+                reply_to=message_id,
+            )
+        else:
+            await self._reply(
+                chat_id,
+                f"{wall} Ask the bot's owner to refresh the 1point3acres session.",
+                reply_to=message_id,
+            )
+        if self.state.acres_cookie and self.state.mark_acres_cookie_stale():
+            await self._notify_owner(
+                "⚠️ A 1point3acres fetch hit the wall, so I've marked that cookie "
+                "<b>stale</b>.\n\n" + ACRES_INSTRUCTIONS
+            )
 
     # ---- status ------------------------------------------------------
 
@@ -523,6 +804,20 @@ class Bot:
             f"media: {'streaming through the bot' if self.sender.streaming else 'CDN URL passthrough'}",
             f"cache: {len(self.notes)} notes ({self.notes.hits} hit / {self.notes.misses} miss), "
             f"{len(self.file_ids)} file ids",
+            *(
+                [
+                    "1point3acres: "
+                    + {
+                        "unset": "no cookie (threads will hit the Cloudflare wall)",
+                        "ok": f"ok, set {_age(self.state.data.get('acres_cookie_set_at'))}",
+                        "stale": "⚠️ stale since a failed fetch, set "
+                        + _age(self.state.data.get("acres_cookie_set_at")),
+                    }[self.state.acres_cookie_status]
+                    + (", with UA" if self.state.acres_ua else "")
+                ]
+                if self.acres
+                else []
+            ),
             f"allowlist: {len(self.state.allowlist)} user(s)",
             f"watching: {len(self.state.groups)} group(s)",
             *([f"xhs via: {escape(self.config.xhs_proxy)}"] if self.config.xhs_proxy else []),
@@ -940,3 +1235,7 @@ class Bot:
 
     async def aclose(self) -> None:
         await self.sender.aclose()
+        if self.acres:
+            await self.acres.aclose()
+        if self.acres_sender:
+            await self.acres_sender.aclose()

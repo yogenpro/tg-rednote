@@ -1,0 +1,546 @@
+"""1point3acres threads, read off the forum page.
+
+The site is a Discuz X forum behind Cloudflare. Two things make it unlike the
+RedNote path:
+
+* **Cloudflare answers anonymous requests with a managed challenge**, so there
+  is no cookieless mode at all. TLS impersonation is not enough — the challenge
+  wants JavaScript — so the only way in is the owner's own browser cookie,
+  which is why this feature is DM-only and owner-provisioned. `cf_clearance` is
+  bound to the User-Agent that solved the challenge, so the UA is stored
+  alongside the cookie rather than hardcoded.
+
+* **The post body is deliberately poisoned.** Between every line break sits a
+  `<font class="jammer">` carrying junk like ". From 1point 3acres bbs",
+  "-baidu 1point3acres" or a lone Greek chi, and `<span style="display:none">`
+  hides more of the same. A browser never renders any of it; a naive
+  tag-stripper splices all of it into the text. `to_text` drops hidden
+  elements wholesale rather than trying to recognise the payloads, and scrubs
+  invisible codepoints on top.
+
+Pages are GBK, not UTF-8. Everything here is best-effort against markup the
+forum owns and can change; a parse miss reports a failure rather than posting
+mangled text.
+"""
+
+from __future__ import annotations
+
+import logging
+import re
+from dataclasses import dataclass, field
+from html import escape
+from html.parser import HTMLParser
+from urllib.parse import urljoin
+
+import httpx
+
+log = logging.getLogger(__name__)
+
+HOST = "www.1point3acres.com"
+BBS_BASE = f"https://{HOST}/bbs/"
+
+# A current desktop Chrome. Only a default: whatever browser solved the
+# Cloudflare challenge decides the UA that its cf_clearance is valid for, and
+# `parse_credentials` picks that one up from a "Copy as cURL" paste.
+DEFAULT_UA = (
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
+)
+
+# The share shapes seen in the wild. The thread id is the same number in all of
+# them — the new /home/thread/ frontend, the /interview/ view and the original
+# Discuz permalink all address one tid — so they all normalise to the forum
+# page, which is the only one that serves the post as HTML.
+_TAIL = r"[^\s\"<>\\^`{|}，。；！？、【】《》]*"
+LINK_RE = re.compile(
+    r"(?:https?://)?(?:www\.)?1point3acres\.com/"
+    r"(?:bbs/thread-\d+[-\d]*\.html"
+    r"|(?:home|interview|bbs)/thread/\d+"
+    rf"|bbs/forum\.php\?{_TAIL}"
+    r")",
+    re.IGNORECASE,
+)
+_TID_RE = re.compile(r"(?:/thread[-/](\d+)|[?&]tid=(\d+))", re.IGNORECASE)
+
+# Cookies a 1point3acres session actually carries. cf_clearance is the
+# Cloudflare pass; the Discuz auth cookie is prefixed with a per-install salt
+# (`Vhcs_2132_auth`, `xxxx_2132_saltkey`, …), so it is matched loosely.
+COOKIE_MARKERS = ("cf_clearance=", "_auth=", "_saltkey=", "_sid=", "_discuz")
+
+# Elements that are not the post. `jammer` is the poison and is genuinely
+# invisible; `locked`, the attachment tips and the "last edited by" line are
+# the forum's own furniture, which reads as noise once it is out of context.
+_HIDDEN_CLASSES = ("jammer", "locked", "attach_nopermission", "attach_tips", "pstatus")
+_DROP_TAGS = {"script", "style", "noscript"}
+_VOID_TAGS = {"br", "img", "hr", "input", "meta", "link", "source", "col", "area", "base", "wbr"}
+_BREAK_TAGS = {"br", "p", "div", "tr", "li", "blockquote", "h1", "h2", "h3", "h4", "table"}
+_HIDDEN_STYLE_RE = re.compile(r"display\s*:\s*none", re.IGNORECASE)
+
+# Zero-width and directional characters, the codepoint-level version of the
+# same trick. ZWJ (U+200D) is deliberately *not* here: it is load-bearing
+# inside compound emoji, and the jammers observed here work at the element
+# level anyway.
+_INVISIBLE_RE = re.compile(
+    "[\u00ad\u180e\u200b\u200c\u200e\u200f\u202a-\u202e\u2060-\u2064"
+    "\u206a-\u206f\u115f\u1160\u3164\ufeff\uffa0]"
+)
+
+# Belt and braces: the exact strings the jammers carry, in case the class name
+# changes but the payload doesn't. The element-level removal already handles
+# all of these, so this list stays *strict* — a looser pattern would eat real
+# sentences. ".google" and ".Waral" only match with the non-ASCII tail the
+# jammer always appends, and a plain mention of the site is never punctuation-led.
+_WATERMARK_RE = re.compile(
+    r"[.．]\s*(?:"
+    r"(?:From\s+)?1\s?point\s?3\s?acres(?:\.com|\s+bbs)?"
+    r"|check\s+1point3acres\s+for\s+more\.?"
+    r"|baidu\s+1point3acres"
+    r"|\u672c\u6587\u539f\u521b\u81ea1point3acres\S*"
+    r"|\u7559\u5b66(?:\u7533\u8bf7)?\u8bba\u575b-\u4e00\u4ea9\u4e09\u5206\u5730"
+    r"|(?:Waral|google)\s*\S*[^\x00-\x7f]\S*"
+    r")",
+    re.IGNORECASE,
+)
+_WHITESPACE_RE = re.compile(r"\s+")
+# Indentation either side of a line break is markup wrapping, not text.
+_LINE_EDGE_RE = re.compile("[ \t\u00a0]*\n[ \t\u00a0]*")
+_BLANK_RUN_RE = re.compile(r"\n{3,}")
+
+# Smilies, spacers and plugin chrome. None of them are the post's own images.
+_CHROME_IMAGE_RE = re.compile(
+    r"(?:^|/)(?:static/image/|source/plugin/|images/)|(?:none|blank|spacer)\.gif$",
+    re.IGNORECASE,
+)
+
+
+class AcresError(RuntimeError):
+    """kind: 'bad_link' | 'challenge' | 'login' | 'network' | 'empty'"""
+
+    def __init__(self, kind: str, message: str):
+        super().__init__(message)
+        self.kind = kind
+
+
+@dataclass
+class Thread:
+    tid: str
+    url: str
+    title: str = ""
+    author: str = ""
+    author_url: str = ""
+    published: str = ""
+    forum: str = ""       # the tag strip under the title ("数科面经")
+    summary: str = ""     # the structured header on interview-experience posts
+    body: str = ""
+    images: list[str] = field(default_factory=list)
+    # True when the post contains content gated behind points or a login, so
+    # what we deliver is knowingly partial and should say so.
+    locked: bool = False
+    needs_login: bool = False
+
+
+def find_acres_link(text: str) -> str | None:
+    match = LINK_RE.search(text or "")
+    if not match:
+        return None
+    url = match.group(0).rstrip(".,!?;:)]}'\"")
+    if not thread_id(url):
+        return None
+    return url if url.lower().startswith("http") else f"https://{url}"
+
+
+def thread_id(url: str) -> str | None:
+    match = _TID_RE.search(url or "")
+    if not match:
+        return None
+    return match.group(1) or match.group(2)
+
+
+def canonical(url: str) -> str:
+    """The one URL shape that serves the post as HTML.
+
+    /home/thread/<tid> is a JavaScript frontend and /interview/thread/<tid> is
+    a different view of the same tid; the Discuz permalink is what carries the
+    post text, so every share shape is rewritten to it.
+    """
+    tid = thread_id(url)
+    if not tid:
+        raise AcresError("bad_link", "no thread id in that link")
+    return f"{BBS_BASE}thread-{tid}-1-1.html"
+
+
+def scrub(text: str) -> str:
+    """Strip the interference and tidy what's left."""
+    text = _INVISIBLE_RE.sub("", text)
+    text = _WATERMARK_RE.sub("", text)
+    text = text.replace("\r\n", "\n").replace("\r", "\n").replace("\u00a0", " ")
+    text = _LINE_EDGE_RE.sub("\n", text)
+    return _BLANK_RUN_RE.sub("\n\n", text).strip()
+
+
+class _Extractor(HTMLParser):
+    """HTML to text, skipping everything a browser wouldn't paint.
+
+    Hidden elements nest (the paywall block is divs inside divs), so this
+    tracks open tags and suppresses output until the element that started the
+    skip closes again — which a regex over the markup cannot do.
+    """
+
+    def __init__(self, base: str = BBS_BASE):
+        super().__init__(convert_charrefs=True)
+        self.base = base
+        self.chunks: list[str] = []
+        self.images: list[str] = []
+        self.locked = False
+        self.needs_login = False
+        self._open: list[str] = []
+        self._skip_depth: int | None = None
+
+    # -- helpers
+    @staticmethod
+    def _hidden(attrs: dict[str, str]) -> str | None:
+        classes = (attrs.get("class") or "").lower()
+        for name in _HIDDEN_CLASSES:
+            if name in classes:
+                return name
+        if _HIDDEN_STYLE_RE.search(attrs.get("style") or ""):
+            return "style"
+        return None
+
+    def _break(self) -> None:
+        if self.chunks and not self.chunks[-1].endswith("\n"):
+            self.chunks.append("\n")
+
+    # -- HTMLParser hooks
+    def handle_starttag(self, tag: str, attrlist) -> None:
+        attrs = {k.lower(): (v or "") for k, v in attrlist}
+        hidden = self._hidden(attrs)
+        if hidden == "locked":
+            # Points-gated text sits mid-sentence. Splicing the two halves
+            # together silently would read as the author's own words, so the
+            # hole is marked where it actually is.
+            self.locked = True
+            if self._skip_depth is None:
+                self.chunks.append(" […] ")
+        elif hidden in ("attach_nopermission", "attach_tips"):
+            self.needs_login = True
+
+        if tag in _VOID_TAGS:
+            if self._skip_depth is None:
+                if tag == "br":
+                    self.chunks.append("\n")
+                elif tag == "img" and not hidden:
+                    self._image(attrs)
+            return
+
+        if self._skip_depth is None and (tag in _DROP_TAGS or hidden):
+            self._skip_depth = len(self._open)
+        if self._skip_depth is None and tag in _BREAK_TAGS:
+            self._break()
+        self._open.append(tag)
+
+    def handle_startendtag(self, tag: str, attrlist) -> None:
+        self.handle_starttag(tag, attrlist)
+        if tag not in _VOID_TAGS:
+            self.handle_endtag(tag)
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag in _VOID_TAGS:
+            return
+        # Discuz emits stray closers; only unwind to a tag we actually opened.
+        if tag not in self._open:
+            return
+        while self._open:
+            popped = self._open.pop()
+            if self._skip_depth is not None and len(self._open) <= self._skip_depth:
+                self._skip_depth = None
+            if popped == tag:
+                break
+        if self._skip_depth is None and tag in _BREAK_TAGS:
+            self._break()
+
+    def handle_data(self, data: str) -> None:
+        if self._skip_depth is None and data:
+            # Newlines in the markup are insignificant whitespace — the forum
+            # wraps its source, and taking those literally double-spaces every
+            # line, because each <br /> is followed by one. The real breaks all
+            # arrive as <br> and block tags.
+            self.chunks.append(_WHITESPACE_RE.sub(" ", data))
+
+    def _image(self, attrs: dict[str, str]) -> None:
+        # Discuz points a thumbnail at a placeholder gif and keeps the real
+        # attachment in `zoomfile`/`file`, so those come first.
+        src = (
+            attrs.get("zoomfile")
+            or attrs.get("file")
+            or attrs.get("data-original")
+            or attrs.get("data-src")
+            or attrs.get("src")
+            or ""
+        ).strip()
+        if not src or src.startswith("data:") or _CHROME_IMAGE_RE.search(src):
+            return
+        url = urljoin(self.base, src)
+        if url not in self.images:
+            self.images.append(url)
+
+    @property
+    def text(self) -> str:
+        return scrub("".join(self.chunks))
+
+
+def to_text(html: str, base: str = BBS_BASE) -> tuple[str, list[str], bool, bool]:
+    """(text, image urls, locked, needs_login) for a fragment of post markup."""
+    extractor = _Extractor(base)
+    extractor.feed(html)
+    extractor.close()
+    return extractor.text, extractor.images, extractor.locked, extractor.needs_login
+
+
+def plain(html: str) -> str:
+    """Just the visible text of a small fragment — a title, a tag."""
+    return to_text(html)[0]
+
+
+def decode(raw: bytes) -> str:
+    """Discuz serves GBK here, and mislabels it often enough to check the meta."""
+    head = raw[:2048].decode("ascii", errors="replace").lower()
+    declared = re.search(r'charset=["\']?([\w-]+)', head)
+    order = [declared.group(1)] if declared else []
+    order += ["gbk", "utf-8"]
+    for encoding in order:
+        try:
+            return raw.decode(encoding)
+        except (UnicodeDecodeError, LookupError):
+            continue
+    return raw.decode("gbk", errors="replace")
+
+
+_SUBJECT_RE = re.compile(r'<span[^>]*id="thread_subject"[^>]*>(.*?)</span>', re.S | re.I)
+_AUTHOR_RE = re.compile(
+    r'<div[^>]*itemprop="author".*?<span[^>]*itemprop="name"[^>]*>(.*?)</span>', re.S | re.I
+)
+_UID_RE = re.compile(r'home\.php\?mod=space&(?:amp;)?uid=(\d+)', re.I)
+_DATE_RE = re.compile(r'<meta[^>]*itemprop="datePublished"[^>]*content="([^"]*)"', re.I)
+_TAG_RE = re.compile(r'<a[^>]*class="taglink[^"]*"[^>]*>(.*?)</a>', re.S | re.I)
+# The structured line interview-experience posts carry above the body: term,
+# role, degree, outcome. It sits in its own span immediately before the post.
+_SUMMARY_RE = re.compile(r'<span style="margin-top: 3px">(.*?)</span>', re.S | re.I)
+_BODY_START_RE = re.compile(r'<td[^>]*class="t_f"[^>]*id="postmessage_(\d+)"[^>]*>', re.I)
+_TD_RE = re.compile(r"</?td\b", re.I)
+_BASE_RE = re.compile(r'<base[^>]*href="([^"]*)"', re.I)
+# What the forum shows instead of a thread when you are not entitled to it.
+_NOTICE_MARKERS = ("提示信息", "您需要登录才可以", "本主题需要", "无权访问", "只有本人可见")
+
+
+def _body(html: str, start: re.Match) -> str:
+    """The post cell, matched by counting <td> rather than to the first </td>.
+
+    A quoted table inside a post would end a non-greedy match early and lose
+    the rest of the text.
+    """
+    depth = 1
+    cursor = start.end()
+    for token in _TD_RE.finditer(html, cursor):
+        depth += -1 if token.group(0).startswith("</") else 1
+        if depth == 0:
+            return html[cursor : token.start()]
+    return html[cursor:]
+
+
+def parse_thread(html: str, url: str) -> Thread | None:
+    """Build a Thread from a Discuz viewthread page, or None if it isn't one."""
+    match = _BODY_START_RE.search(html)
+    if not match:
+        return None
+    base_match = _BASE_RE.search(html)
+    base = base_match.group(1) if base_match else BBS_BASE
+
+    text, images, locked, needs_login = to_text(_body(html, match), base)
+    thread = Thread(
+        tid=thread_id(url) or "",
+        url=url,
+        title=plain(_SUBJECT_RE.search(html).group(1)) if _SUBJECT_RE.search(html) else "",
+        body=text,
+        images=images,
+        locked=locked,
+        needs_login=needs_login,
+    )
+    author = _AUTHOR_RE.search(html)
+    if author:
+        thread.author = plain(author.group(1))
+    uid = _UID_RE.search(html)
+    if uid:
+        thread.author_url = f"https://{HOST}/bbs/space-uid-{uid.group(1)}.html"
+    published = _DATE_RE.search(html)
+    if published:
+        thread.published = published.group(1).strip()
+    tag = _TAG_RE.search(html)
+    if tag:
+        thread.forum = plain(tag.group(1))
+    summary = _SUMMARY_RE.search(html)
+    if summary:
+        # Only the header that belongs to the opening post: anything found
+        # after the body has started belongs to a reply.
+        if summary.start() < match.start():
+            thread.summary = plain(summary.group(1))
+    return thread
+
+
+def parse_credentials(text: str) -> tuple[str, str]:
+    """(cookie, user agent) from a pasted cookie or a "Copy as cURL".
+
+    The cURL form is worth supporting because `cf_clearance` is only valid for
+    the User-Agent that earned it — pasting the curl command carries both, and
+    a bare cookie leaves the UA to the default and to luck.
+    """
+    text = text.strip()
+    if not text.lower().startswith("curl"):
+        return text, ""
+    header = r"""-(?:H|-header)\s+(['"])\s*%s\s*:\s*(.*?)\1"""
+    cookie = re.search(header % "cookie", text, re.I | re.S)
+    if not cookie:
+        cookie = re.search(r"""-(?:b|-cookie)\s+(['"])(.*?)\1""", text, re.I | re.S)
+    agent = re.search(header % "user-agent", text, re.I | re.S)
+    if not agent:
+        agent = re.search(r"""-(?:A|-user-agent)\s+(['"])(.*?)\1""", text, re.I | re.S)
+    return (
+        cookie.group(2).strip() if cookie else "",
+        agent.group(2).strip() if agent else "",
+    )
+
+
+def looks_like_cookie(text: str) -> bool:
+    """Is a bare paste a forum session?
+
+    A false positive here is expensive: the cookie handler *deletes* the
+    message it was given. A URL can carry any of these markers in a query
+    string, so anything that looks like a link is never a cookie.
+    """
+    stripped = text.strip()
+    if len(stripped) < 40 or "\n" in stripped:
+        return False
+    if "://" in stripped or stripped.lower().startswith("www."):
+        return False
+    return "=" in stripped and any(m in stripped for m in COOKIE_MARKERS)
+
+
+class Acres:
+    """Fetches a thread page with the owner's browser credentials."""
+
+    def __init__(self, timeout: float = 60.0, user_agent: str = DEFAULT_UA):
+        self._ua = user_agent or DEFAULT_UA
+        self._client = httpx.AsyncClient(timeout=timeout, follow_redirects=True)
+
+    async def aclose(self) -> None:
+        await self._client.aclose()
+
+    def headers(self, cookie: str | None, user_agent: str | None = None) -> dict[str, str]:
+        headers = {
+            "User-Agent": user_agent or self._ua,
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.9,zh-CN;q=0.8",
+            "Referer": f"https://{HOST}/",
+        }
+        if cookie:
+            headers["Cookie"] = cookie
+        return headers
+
+    async def thread(
+        self, url: str, cookie: str | None = None, user_agent: str | None = None
+    ) -> Thread:
+        target = canonical(url)
+        try:
+            response = await self._client.get(target, headers=self.headers(cookie, user_agent))
+        except httpx.HTTPError as exc:
+            # Never let the cookie ride out on a traceback (PLAN §7).
+            raise AcresError("network", f"1point3acres unreachable: {type(exc).__name__}") from None
+
+        html = decode(response.content)
+        if _challenged(response.status_code, html):
+            raise AcresError(
+                "challenge",
+                "Cloudflare answered with a challenge instead of the thread",
+            )
+        if response.status_code >= 400:
+            raise AcresError("network", f"1point3acres returned HTTP {response.status_code}")
+
+        thread = parse_thread(html, target)
+        if thread is None:
+            if any(marker in html for marker in _NOTICE_MARKERS):
+                raise AcresError("login", "the forum served a notice page instead of the thread")
+            raise AcresError("empty", "no post found on that page")
+        if not thread.body and not thread.images:
+            raise AcresError("empty", "that thread's opening post is empty")
+        return thread
+
+
+def _challenged(status: int, html: str) -> bool:
+    return "_cf_chl_opt" in html or (status == 403 and "Just a moment" in html)
+
+
+# Rendering lives here rather than in media.py because a forum thread's shape
+# is nothing like a note's: no tags, a structured header line, and a body that
+# is usually far too long for a caption.
+def render(thread: Thread, *, limit: int, reserve: int = 0) -> tuple[str, str]:
+    """(HTML for the first message, plain-text overflow).
+
+    Same contract as media.build_caption: the footer is reserved up front so it
+    survives truncation, and whatever the body cannot fit comes back for a
+    follow-up message. Lengths are UTF-16 code units on the *parsed* text.
+    """
+    from .media import tg_len, tg_truncate
+
+    limit = max(0, limit - reserve)
+    link_text = "open on 1point3acres"
+    bits = [b for b in (thread.author, thread.published.split(" ")[0], thread.forum) if b]
+    foot_plain = " · ".join(bits + [link_text])
+    foot_html = " · ".join(
+        [escape(b) for b in bits]
+        + [f'<a href="{escape(thread.url, quote=True)}">{link_text}</a>']
+    )
+
+    head_html = ""
+    head_len = 0
+    if thread.title:
+        head_html = f"<b>{escape(thread.title)}</b>"
+        head_len = tg_len(thread.title) + 2
+    summary = thread.summary
+    if summary and head_len + tg_len(summary) + 2 > limit // 2:
+        summary = ""  # a header line is context, never worth the body's room
+    if summary:
+        head_html = f"{head_html}\n<i>{escape(summary)}</i>" if head_html else f"<i>{escape(summary)}</i>"
+        head_len += tg_len(summary) + 1
+
+    # A gated thread has to say so, and it reads as part of the post rather
+    # than as a message of its own — so its room is reserved like the footer's.
+    gated = thread.locked or thread.needs_login
+    note_len = tg_len(GATED_NOTE) + 2 if gated else 0
+    room = max(0, limit - (2 + tg_len(foot_plain)) - head_len - note_len)
+    if tg_len(thread.body) > room:
+        body, overflow = tg_truncate(thread.body, max(0, room - 1))
+        body = f"{body.rstrip()}…" if body else ""
+        if not body:
+            overflow = thread.body
+    else:
+        body, overflow = thread.body, ""
+
+    blocks = [
+        block
+        for block in (
+            head_html,
+            escape(body) if body else "",
+            f"<i>{GATED_NOTE}</i>" if gated else "",
+            foot_html,
+        )
+        if block
+    ]
+    return "\n\n".join(blocks), overflow
+
+
+# No apostrophes: this is the one string that reaches Telegram unescaped, as
+# markup rather than as post text.
+GATED_NOTE = (
+    "⚠️ Part of this thread sits behind the forum points wall — "
+    "open it on 1point3acres for the rest."
+)

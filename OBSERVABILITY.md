@@ -30,8 +30,8 @@ a single note's whole journey comes out with one filter — which is the differe
 | `event` | When | Fields worth querying |
 |---|---|---|
 | `startup` | Process start | `media_mode`, `comments`, `channel`, `groups`, `proxied` |
-| `submission` | A link arrives | `source` = `dm` \| `group` |
-| `note` | Metadata in hand | `kind` = `image` \| `video`, `items`, `cached`, `origin` = `sidecar` \| `page` |
+| `submission` | A link arrives | `source` = `dm` \| `group`, `site` |
+| `note` | Metadata in hand | `kind` = `image` \| `video` \| `thread`, `items`, `cached`, `origin` = `sidecar` \| `page` |
 | `comments` | Comment scrape done | `count` |
 | `delivery` | Media sent | `items`, `seconds`, `mode` = `url` \| `upload`, `skipped` |
 | `published` | Live on the channel | `message_id`, `url` |
@@ -44,6 +44,12 @@ a single note's whole journey comes out with one filter — which is the differe
 | `delivery_empty` | Nothing sent at all | `note` |
 | `poll_error` / `poll_conflict` | Telegram polling trouble | `code` |
 | `crash` | Unhandled error on an update | `update_id` |
+
+**`site` names the source when it isn't RedNote.** Lines from the 1point3acres path carry
+`site="1p3a"` on `submission`, `note`, `delivery`, `media_skipped` and `fetch_failed`; RedNote
+lines have no `site` key at all, so `site=""` selects them. Its `fetch_failed` kinds are its
+own: `challenge` (Cloudflare), `login` (the forum's notice page), `bad_link`, `network`,
+`empty`.
 
 Health of the process itself is separate: the container's `HEALTHCHECK` reads a heartbeat file
 the poll loop touches, so a wedged bot goes `unhealthy` without needing any of this.
@@ -155,6 +161,11 @@ sum by (mode) (count_over_time({service="tg-rednote", event="delivery"} | json [
 **Which CDN families has Telegram refused?**
 ```logql
 {service="tg-rednote", event="cdn_refused"} | json | line_format "{{.families}} {{.reason}}"
+```
+
+**How is the forum session holding up?** (a run of these means the cookie needs refreshing)
+```logql
+sum by (kind) (count_over_time({service="tg-rednote", event="fetch_failed"} | json | site="1p3a" [24h]))
 ```
 
 **What happened to one specific note?**

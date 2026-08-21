@@ -1,0 +1,100 @@
+# One stack, one machine, one residential IP (PLAN §2.3).
+# Nothing here listens on the host: the bot long-polls Telegram outbound and
+# talks to the sidecar over the compose network.
+#
+#   cp .env.example .env   # put your BotFather token in it
+#   docker compose up -d
+#   docker compose logs -f bot
+
+services:
+  # Optional: send XHS-bound traffic out through a machine on your tailnet
+  # (a home box) while Telegram keeps using this host's own connection.
+  # Enable with `docker compose --profile tailscale up -d` and set
+  # XHS_PROXY=http://tailscale:1055 in .env. See the README.
+  tailscale:
+    image: tailscale/tailscale:stable
+    container_name: xhs-tailscale
+    profiles: ["tailscale"]
+    restart: unless-stopped
+    environment:
+      # Both come from .env; the profile is useless without them.
+      TS_AUTHKEY: ${TS_AUTHKEY:-}
+      TS_HOSTNAME: ${TS_HOSTNAME:-tg-rednote}
+      # Userspace mode: no TUN device, no NET_ADMIN, no host routing changes.
+      # tailscaled's own HTTP proxy is the only way in, which is exactly the
+      # narrow door we want.
+      TS_USERSPACE: "true"
+      TS_STATE_DIR: /var/lib/tailscale
+      TS_EXTRA_ARGS: --exit-node=${TS_EXIT_NODE:-} --exit-node-allow-lan-access
+      TS_TAILSCALED_EXTRA_ARGS: --outbound-http-proxy-listen=0.0.0.0:1055
+    volumes:
+      - tailscale-state:/var/lib/tailscale
+    healthcheck:
+      test: ["CMD-SHELL", "tailscale status --peers=false >/dev/null 2>&1 || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
+    logging: &logging
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  xhs-downloader:
+    # Pinned, not :latest — the API surface moved between releases (PLAN §3).
+    image: joeanamier/xhs-downloader:2.7
+    container_name: xhs-downloader
+    command: ["python", "main.py", "api"]
+    restart: unless-stopped
+    volumes:
+      # settings.json lives here; the container writes back to it on start.
+      - ./xhs-volume:/app/Volume
+    # Uncomment to poke the API from the host (tools/spike.py --downloader).
+    # ports:
+    #   - "127.0.0.1:5556:5556"
+    healthcheck:
+      # A plain TCP connect: the root path 307s off to GitHub, which would make
+      # the healthcheck depend on outbound internet rather than the sidecar.
+      test:
+        - CMD-SHELL
+        - >-
+          python -c "import socket;socket.create_connection(('127.0.0.1',5556),5).close()"
+          || exit 1
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
+    logging: *logging
+
+  bot:
+    build: ./bot
+    image: tg-rednote:latest
+    container_name: xhs-bot
+    restart: unless-stopped
+    env_file:
+      # Not required, so a missing .env fails with the bot's own advice about
+      # TG_BOT_TOKEN rather than a compose stat error.
+      - path: .env
+        required: false
+    environment:
+      # Set here rather than in .env: they describe this stack's wiring, not
+      # the operator's preferences.
+      XHS_DOWNLOADER_URL: http://xhs-downloader:5556
+      STATE_PATH: /data/state.json
+    volumes:
+      # Holds the owner, allowlist, published index and the XHS cookie.
+      # Back this up; losing it means re-pairing and re-adding the cookie.
+      - bot-state:/data
+    depends_on:
+      xhs-downloader:
+        # The bot survives a missing sidecar, but starting in order means the
+        # first submission after a reboot doesn't have to fail first.
+        condition: service_healthy
+    # The bot is mid-upload for up to a minute on a big video; let it finish.
+    stop_grace_period: 60s
+    logging: *logging
+
+volumes:
+  bot-state:
+  tailscale-state:

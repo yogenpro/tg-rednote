@@ -1,0 +1,19 @@
+# Secrets and live state — never commit these.
+.env
+*.env
+!.env.example
+data/
+state.json
+*.log
+
+# The sidecar writes its own settings and a download DB into this volume;
+# only the seeded settings file belongs in the repo.
+xhs-volume/*
+!xhs-volume/settings.json
+
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+.DS_Store

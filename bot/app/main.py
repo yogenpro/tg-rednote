@@ -1,0 +1,136 @@
+"""Entrypoint: long polling, no webhook, no inbound exposure (PLAN §2.3)."""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+import signal
+import sys
+import time
+
+from .config import Config
+from .logs import fields, setup_logging
+from .handlers import Bot
+from .state import State
+from .telegram import Telegram, TelegramError
+from .xhs import XhsDownloader
+
+log = logging.getLogger("xhsbot")
+
+
+def beat(config: Config) -> None:
+    """Record that the poller is alive; the container healthcheck reads this."""
+    try:
+        config.heartbeat_path.write_text(f"{time.time():.0f}\n")
+    except OSError as exc:  # a missing heartbeat is not worth dying over
+        log.debug("could not write heartbeat: %s", exc)
+
+
+async def poll(bot: Bot, telegram: Telegram, config: Config, stop: asyncio.Event) -> None:
+    offset: int | None = None
+    tasks: set[asyncio.Task] = set()
+    backoff = 1
+
+    while not stop.is_set():
+        try:
+            updates = await telegram.get_updates(offset, config.poll_timeout)
+            backoff = 1
+            beat(config)
+        except TelegramError as exc:
+            if exc.error_code == 409:
+                log.error(
+                    "another instance is polling this token (409) — exiting",
+                    extra=fields(event="poll_conflict"),
+                )
+                stop.set()
+                break
+            log.warning(
+                "getUpdates failed: %s (retrying in %ss)", exc.description, backoff,
+                extra=fields(event="poll_error", code=exc.error_code, backoff=backoff),
+            )
+            await asyncio.sleep(backoff)
+            backoff = min(backoff * 2, 60)
+            continue
+
+        for update in updates or []:
+            offset = update["update_id"] + 1
+            task = asyncio.create_task(guard(bot, update))
+            tasks.add(task)
+            task.add_done_callback(tasks.discard)
+
+    if tasks:
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+
+async def guard(bot: Bot, update: dict) -> None:
+    try:
+        await bot.handle_update(update)
+    except Exception:  # a bad note must never take the poller down
+        log.exception(
+            "unhandled error on update %s", update.get("update_id"),
+            extra=fields(event="crash", update_id=update.get("update_id")),
+        )
+
+
+async def run() -> None:
+    config = Config.from_env()
+    setup_logging(config.log_format)
+    state = State(config.state_path)
+    telegram = Telegram(config.bot_token, config.api_base, config.http_timeout)
+    downloader = XhsDownloader(config.downloader_url, config.fetch_timeout, config.xhs_proxy)
+    bot = Bot(config, state, telegram, downloader)
+
+    try:
+        me = await telegram.get_me()
+        log.info("connected as @%s (%s)", me.get("username"), me.get("id"))
+    except TelegramError as exc:
+        raise SystemExit(f"could not reach Telegram: {exc.description}") from None
+
+    if not await downloader.healthy():
+        log.warning("downloader at %s is not answering yet", config.downloader_url)
+
+    bot.bootstrap()
+    await bot.check_channel(me)
+    log.info(
+        "media mode=%s live-photos=%s cache=%d%s",
+        config.media_mode,
+        config.live_photos,
+        config.cache_size,
+        f" xhs-proxy={config.xhs_proxy}" if config.xhs_proxy else "",
+        extra=fields(
+            event="startup",
+            media_mode=config.media_mode,
+            live_photos=config.live_photos,
+            comments=config.comments,
+            channel=bool(config.channel_id),
+            groups=len(state.groups),
+            proxied=bool(config.xhs_proxy),
+        ),
+    )
+
+    stop = asyncio.Event()
+    loop = asyncio.get_running_loop()
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        try:
+            loop.add_signal_handler(sig, stop.set)
+        except NotImplementedError:  # not a POSIX event loop
+            signal.signal(sig, lambda *_: stop.set())
+
+    try:
+        await poll(bot, telegram, config, stop)
+    finally:
+        log.info("shutting down")
+        await bot.aclose()
+        await downloader.aclose()
+        await telegram.aclose()
+
+
+def main() -> None:
+    try:
+        asyncio.run(run())
+    except KeyboardInterrupt:
+        pass
+
+
+if __name__ == "__main__":
+    main()

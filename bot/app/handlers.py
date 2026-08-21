@@ -1,0 +1,942 @@
+"""Update handling: allowlist, bootstrap, cookie custody, and the note flow."""
+
+from __future__ import annotations
+
+import asyncio
+import contextlib
+import json
+import logging
+import time
+from datetime import datetime, timezone
+from html import escape
+
+from .cache import LRU
+from .config import Config
+from .logs import current_rid, fields, new_rid
+from .comments import fit_into_caption, render_comments, strip_tags
+from .media import MEDIA_GROUP_LIMIT, MediaSender, build_caption, split_message, tg_len
+from .state import State, generate_pairing_code
+from .telegram import CAPTION_LIMIT, MESSAGE_LIMIT, Telegram, TelegramError
+from .xhs import Note, XhsDownloader, XhsError, cache_key, find_link
+
+log = logging.getLogger(__name__)
+
+
+@contextlib.asynccontextmanager
+async def _nothing():
+    """Stand-in for a progress indicator when there is no one watching."""
+    yield None
+
+COOKIE_MARKERS = ("web_session=", "a1=", "webid=", "gid=")
+
+HELP = """<b>RedNote → Telegram</b>
+
+Send me a Xiaohongshu share link and I'll post the note back as native media.
+
+/status — cookie age, last successful fetch, sidecar health
+/cookie &lt;value&gt; — set the XHS cookie (the message is deleted on receipt)
+/forgetcookie — wipe the stored cookie
+/help — this message"""
+
+OWNER_HELP = HELP + """
+
+<b>Owner only</b>
+/allow &lt;user_id&gt; · /deny &lt;user_id&gt; · /users
+/groups · /allowgroup &lt;chat_id&gt; · /denygroup &lt;chat_id&gt;"""
+
+# Shown at the foot of a message that has a continuation. Kept short: it costs
+# caption room, which the note's own text would rather have.
+CONTINUED = "continues ↓"
+CONTINUED_COST = 16  # the text, plus the blank line before it
+
+COOKIE_INSTRUCTIONS = (
+    "Open <b>xiaohongshu.com</b> in a logged-in browser → DevTools → "
+    "Network → any request → copy the whole <code>Cookie</code> request header, "
+    "then send it here as <code>/cookie &lt;value&gt;</code>.\n\n"
+    "I delete the message as soon as I've stored it, but it still transited "
+    "Telegram's servers — treat the cookie as burned if that matters to you."
+)
+
+
+def _age(iso: str | None) -> str:
+    if not iso:
+        return "never"
+    try:
+        then = datetime.fromisoformat(iso.replace("Z", "+00:00"))
+    except ValueError:
+        return iso
+    delta = datetime.now(timezone.utc) - then
+    seconds = int(delta.total_seconds())
+    if seconds < 90:
+        return f"{seconds}s ago"
+    if seconds < 5400:
+        return f"{seconds // 60}m ago"
+    if seconds < 172800:
+        return f"{seconds // 3600}h ago"
+    return f"{seconds // 86400}d ago"
+
+
+def message_candidates(message: dict) -> list[str]:
+    """Every place a share link can hide in a Telegram message.
+
+    Forwarded messages and rich pastes routinely carry the URL only in a
+    `text_link` entity, where the visible text is a title and the URL is
+    attached to it — searching `text` alone finds nothing.
+    """
+    candidates = []
+    for field in ("text", "caption"):
+        value = message.get(field)
+        if value:
+            candidates.append(value)
+    for field in ("entities", "caption_entities"):
+        for entity in message.get(field) or []:
+            url = entity.get("url")
+            if url:
+                candidates.append(url)
+    return candidates
+
+
+def looks_like_cookie(text: str) -> bool:
+    stripped = text.strip()
+    if len(stripped) < 40 or "\n" in stripped.strip():
+        return False
+    return sum(marker in stripped for marker in COOKIE_MARKERS) >= 1 and "=" in stripped
+
+
+class Bot:
+    # Telegram drops a chat action after ~5s; refresh just inside that.
+    _beat_interval = 4.0
+
+    def __init__(self, config: Config, state: State, telegram: Telegram, downloader: XhsDownloader):
+        self.config = config
+        self.state = state
+        self.tg = telegram
+        self.xhs = downloader
+        self.notes: LRU[Note] = LRU(maxsize=config.cache_size, ttl=config.cache_ttl_seconds)
+        self._told_owner_cookieless = False
+        self.file_ids: LRU[str] = LRU(maxsize=512)
+        self.sender = MediaSender(
+            telegram,
+            mode=config.media_mode,
+            max_bytes=config.max_upload_bytes,
+            file_ids=self.file_ids,
+            proxy=config.xhs_proxy,
+        )
+        self.pairing_code: str | None = None
+        self.started_at = time.monotonic()
+        self._refused: set[int] = set()
+        self._warned_cookieless = False
+        # Filled in by check_channel() at startup when CHANNEL_ID is set.
+        self.channel: dict | None = None
+
+    # ---- bootstrap ---------------------------------------------------
+
+    def bootstrap(self) -> None:
+        if self.config.owner_id and not self.state.owner_id:
+            self.state.claim_owner(self.config.owner_id)
+            log.info("owner set from OWNER_ID: %s", self.config.owner_id)
+        if self.state.owner_id:
+            log.info("owner is %s, %d user(s) allowlisted", self.state.owner_id, len(self.state.allowlist))
+            return
+        self.pairing_code = generate_pairing_code()
+        log.info("=" * 58)
+        log.info("No owner yet. Send this to the bot to claim it:")
+        log.info("    /start %s", self.pairing_code)
+        log.info("=" * 58)
+
+    async def check_channel(self, me: dict) -> None:
+        """Resolve the target channel and confirm we may post to it.
+
+        Doing this at startup turns "the bot silently can't publish" into one
+        clear line in the log, instead of a failure on someone's first
+        submission.
+        """
+        target = self.config.channel_id
+        if not target:
+            return
+        try:
+            chat = await self.tg.get_chat(target)
+            member = await self.tg.get_chat_member(target, me["id"])
+        except TelegramError as exc:
+            log.error("CHANNEL_ID=%s is unusable: %s", target, exc.description)
+            log.error("Add the bot to the channel as an admin with 'Post Messages'.")
+            return
+
+        status = member.get("status")
+        can_post = member.get("can_post_messages", status == "creator")
+        if status not in ("administrator", "creator") or not can_post:
+            log.error(
+                "the bot is %s in %s and cannot post — grant 'Post Messages'",
+                status or "not a member",
+                chat.get("title") or target,
+            )
+            return
+
+        self.channel = {
+            "id": chat.get("id", target),
+            "username": chat.get("username"),
+            "title": chat.get("title") or str(target),
+        }
+        log.info(
+            "publishing submissions to %s (%s)",
+            self.channel["title"],
+            f"@{self.channel['username']}" if self.channel["username"] else "private channel",
+        )
+
+    async def _handle_group_message(self, chat: dict, message: dict) -> None:
+        """Publish any RedNote link. The only thing said back is the permalink."""
+        chat_id = chat.get("id")
+        if not self.state.listens_in(chat_id):
+            return
+        link = next(
+            (found for found in map(find_link, message_candidates(message)) if found), None
+        )
+        if not link:
+            return
+        if not self.channel:
+            log.info("ignoring a link from %s: no channel configured", chat.get("title"))
+            return
+        current_rid.set(new_rid())
+        log.info(
+            "submission from group %s (%s): %s",
+            chat.get("title") or chat_id,
+            (message.get("from") or {}).get("id"),
+            link,
+            extra=fields(event="submission", source="group", group=chat_id),
+        )
+        # No reply chat: progress and failures stay out of the group entirely.
+        # The finished post is the exception — it goes back as a reply to the
+        # message that offered the link, so whoever shared it can see where it
+        # landed.
+        await self._handle_link(
+            None,
+            None,
+            link,
+            (message.get("from") or {}).get("id"),
+            announce_to=(chat_id, message.get("message_id")),
+        )
+
+    async def _handle_membership(self, event: dict) -> None:
+        """React to the bot being added to or removed from a group."""
+        chat = event.get("chat") or {}
+        if chat.get("type") not in ("group", "supergroup"):
+            return
+        status = (event.get("new_chat_member") or {}).get("status")
+        actor = (event.get("from") or {}).get("id")
+        title = chat.get("title") or str(chat.get("id"))
+
+        if status in ("left", "kicked"):
+            if self.state.deny_group(chat["id"]):
+                log.info("removed from %s; no longer listening there", title)
+            return
+        if status not in ("member", "administrator", "creator"):
+            return
+
+        # Anyone can drag a bot into a group; only a trusted invite makes it
+        # a source for the channel.
+        if self.state.is_allowed(actor):
+            if self.state.allow_group(chat["id"], title, actor):
+                log.info("listening for links in %s (added by %s)", title, actor)
+                await self._notify_owner(
+                    f"👂 Now watching <b>{escape(title)}</b> for RedNote links. "
+                    "I'll publish what I find and stay silent there."
+                )
+            return
+        log.warning("added to %s by %s, who is not allowlisted — ignoring it", title, actor)
+        await self._notify_owner(
+            f"I was added to <b>{escape(title)}</b> (<code>{chat['id']}</code>) by an "
+            f"unknown user (<code>{actor}</code>). I'm ignoring it.\n\n"
+            f"To watch it anyway: <code>/allowgroup {chat['id']}</code>"
+        )
+
+    async def _send_and_track(
+        self, chat_id: int | str, text: str, *, reply_to: int | None = None
+    ) -> int | None:
+        """Like _reply, but hands back the message id so it can be linked to."""
+        try:
+            sent = await self.tg.send_message(chat_id, text, reply_to=reply_to)
+        except TelegramError as exc:
+            log.error("could not post a follow-up to %s: %s", chat_id, exc.description)
+            return None
+        return (sent or {}).get("message_id")
+
+    async def _link_the_chain(
+        self, chat_id: int | str, chain: list[tuple[int, str, bool]]
+    ) -> None:
+        """Point every message at the next one.
+
+        Telegram's reply chain vanishes when a post is forwarded elsewhere, so
+        the pointer has to live in the message body. The room for it was
+        reserved when the caption was built.
+        """
+        for (message_id, body, is_caption), (next_id, _, _) in zip(chain, chain[1:]):
+            link = self.message_link(next_id)
+            if not link:
+                continue
+            body = f'{body}\n\n<a href="{link}">{CONTINUED}</a>'
+            try:
+                if is_caption:
+                    await self.tg.edit_message_caption(chat_id, message_id, body)
+                else:
+                    await self.tg.edit_message_text(chat_id, message_id, body)
+            except TelegramError as exc:
+                log.warning(
+                    "could not link message %s to %s: %s", message_id, next_id, exc.description
+                )
+
+    def message_link(self, message_id: int) -> str | None:
+        """A t.me permalink for a post in the configured channel."""
+        if not self.channel or not message_id:
+            return None
+        username = self.channel["username"]
+        if username:
+            return f"https://t.me/{username}/{message_id}"
+        internal = str(self.channel["id"]).removeprefix("-100")
+        return f"https://t.me/c/{internal}/{message_id}"
+
+    # ---- entry point -------------------------------------------------
+
+    async def handle_update(self, update: dict) -> None:
+        if update.get("my_chat_member"):
+            await self._handle_membership(update["my_chat_member"])
+            return
+
+        message = update.get("message")
+        if not message:
+            return
+        chat = message.get("chat") or {}
+        chat_id = chat.get("id")
+
+        # Groups are listen-only: a RedNote link there becomes a submission and
+        # nothing is ever said back. Everything else in a group — including a
+        # channel's discussion mirror — is none of our business.
+        if chat.get("type") != "private":
+            await self._handle_group_message(chat, message)
+            return
+
+        sender = message.get("from") or {}
+        user_id = sender.get("id")
+        if not user_id or not chat_id:
+            return
+        text = (message.get("text") or message.get("caption") or "").strip()
+        candidates = message_candidates(message)
+
+        if not self.state.owner_id:
+            await self._try_pairing(chat_id, user_id, message.get("message_id"), text)
+            return
+
+        if not self.state.is_allowed(user_id):
+            log.warning("rejected update from %s (@%s)", user_id, sender.get("username"))
+            if user_id not in self._refused:
+                self._refused.add(user_id)
+                await self._reply(chat_id, "Not authorised.")
+            return
+
+        if not text and not candidates:
+            return
+
+        # Cookie first: a bare paste must be recognised before anything logs it.
+        if text.startswith("/cookie") or looks_like_cookie(text):
+            await self._handle_cookie(chat_id, user_id, message.get("message_id"), text)
+            return
+
+        command = text.split()[0].lower().split("@")[0]
+        if command in ("/start", "/help"):
+            await self._reply(chat_id, self._help_text(user_id))
+            return
+        if command == "/status":
+            await self._handle_status(chat_id)
+            return
+        if command == "/forgetcookie":
+            self.state.clear_cookie()
+            await self._reply(chat_id, "Cookie wiped. Fetches will run unauthenticated.")
+            return
+        if command in ("/allow", "/deny", "/users"):
+            await self._handle_admin(chat_id, user_id, command, text)
+            return
+        if command in ("/allowgroup", "/denygroup", "/groups"):
+            await self._handle_groups(chat_id, user_id, command, text)
+            return
+
+        link = next((found for found in map(find_link, candidates) if found), None)
+        # Never log message text: a mistyped cookie would end up in the log.
+        log.info(
+            "message %s from %s: %d chars, %d candidate(s), link=%s",
+            message.get("message_id"),
+            user_id,
+            len(text),
+            len(candidates),
+            link or "none",
+        )
+        if self.config.debug_updates:
+            log.info("update dump: %s", json.dumps(message, ensure_ascii=False)[:2000])
+
+        if link:
+            current_rid.set(new_rid())
+            log.info("submission from %s", user_id, extra=fields(event="submission", source="dm"))
+            await self._handle_link(chat_id, message.get("message_id"), link, user_id)
+            return
+        if command.startswith("/"):
+            await self._reply(chat_id, "Unknown command. /help")
+            return
+        if any(marker in " ".join(candidates).lower() for marker in ("xhslink", "xiaohongshu", "xhs.cn")):
+            await self._reply(
+                chat_id,
+                "That looks like a RedNote share, but I couldn't parse a link out of it. "
+                "Try pasting the URL on its own.",
+                reply_to=message.get("message_id"),
+            )
+
+    # ---- pairing -----------------------------------------------------
+
+    async def _try_pairing(self, chat_id: int, user_id: int, message_id: int | None, text: str) -> None:
+        parts = text.split()
+        supplied = parts[1].strip().upper() if len(parts) > 1 else ""
+        if parts and parts[0].lower().startswith("/start") and supplied and self.pairing_code:
+            if supplied.replace("-", "") == self.pairing_code.replace("-", ""):
+                self.state.claim_owner(user_id)
+                self.pairing_code = None
+                log.info("owner claimed by %s", user_id)
+                await self._reply(
+                    chat_id,
+                    "Paired. You own this instance and are on the allowlist.\n\n" + HELP,
+                )
+                return
+        log.warning("failed pairing attempt from %s", user_id)
+        await self._reply(
+            chat_id,
+            "This instance is unclaimed. Its operator can find the pairing code "
+            "in <code>docker compose logs bot</code> and send "
+            "<code>/start &lt;code&gt;</code>.",
+        )
+
+    # ---- cookie ------------------------------------------------------
+
+    async def _handle_cookie(self, chat_id: int, user_id: int, message_id: int | None, text: str) -> None:
+        # Delete first: the value is on Telegram's servers until we do (PLAN §7).
+        deleted = await self.tg.delete_message(chat_id, message_id) if message_id else False
+
+        if user_id != self.state.owner_id:
+            await self._reply(chat_id, "Only the owner can set the cookie.")
+            return
+
+        value = text.split(None, 1)[1].strip() if text.startswith("/cookie") and " " in text else text.strip()
+        if not value or not looks_like_cookie(value):
+            await self._reply(
+                chat_id,
+                "That doesn't look like an XHS cookie (no <code>web_session</code> / "
+                "<code>a1</code>).\n\n" + COOKIE_INSTRUCTIONS,
+            )
+            return
+
+        self.state.set_cookie(value)
+        note = "" if deleted else (
+            "\n\n⚠️ I could not delete your message — delete it manually."
+        )
+        await self._reply(
+            chat_id,
+            f"Cookie stored ({len(value)} chars) and marked healthy.{note}",
+        )
+
+    # ---- status ------------------------------------------------------
+
+    def _help_text(self, user_id: int) -> str:
+        base = OWNER_HELP if user_id == self.state.owner_id else HELP
+        if not self.channel:
+            return base
+        where = (
+            f"@{self.channel['username']}"
+            if self.channel["username"]
+            else escape(self.channel["title"])
+        )
+        return base.replace(
+            "Send me a Xiaohongshu share link and I'll post the note back as native media.",
+            f"Send me a Xiaohongshu share link to submit it to <b>{where}</b>. If the fetch "
+            "works I'll publish it there and send you a link to the post.",
+            1,
+        )
+
+    async def _handle_groups(self, chat_id: int, user_id: int, command: str, text: str) -> None:
+        if user_id != self.state.owner_id:
+            await self._reply(chat_id, "Owner only.")
+            return
+
+        groups = self.state.groups
+        if command == "/groups":
+            if not groups:
+                await self._reply(
+                    chat_id,
+                    "Not watching any groups. Add me to one — links posted there become "
+                    "submissions, and I stay silent.",
+                )
+                return
+            listing = "\n".join(
+                f"<code>{cid}</code> — {escape(str(info.get('title') or '?'))}"
+                for cid, info in groups.items()
+            )
+            await self._reply(chat_id, f"<b>Watching</b>\n{listing}")
+            return
+
+        parts = text.split()
+        if len(parts) < 2:
+            await self._reply(chat_id, f"Usage: <code>{command} &lt;chat_id&gt;</code>")
+            return
+        try:
+            target = int(parts[1])
+        except ValueError:
+            await self._reply(chat_id, "That is not a chat id.")
+            return
+
+        if command == "/denygroup":
+            removed = self.state.deny_group(target)
+            await self._reply(
+                chat_id, f"{target} {'is no longer watched' if removed else 'was not watched'}."
+            )
+            return
+
+        title = str(target)
+        try:
+            chat = await self.tg.get_chat(target)
+            title = chat.get("title") or title
+        except TelegramError as exc:
+            await self._reply(chat_id, f"I can't see that chat: <code>{escape(exc.description)}</code>")
+            return
+        added = self.state.allow_group(target, title, user_id)
+        await self._reply(
+            chat_id,
+            f"Watching <b>{escape(title)}</b>." if added else f"Already watching {escape(title)}.",
+        )
+
+    async def _handle_status(self, chat_id: int) -> None:
+        healthy = await self.xhs.healthy()
+        uptime = int(time.monotonic() - self.started_at)
+        cookie_line = {
+            "unset": "none (unauthenticated fetches)",
+            "ok": f"ok, set {_age(self.state.data.get('cookie_set_at'))}",
+            "stale": f"⚠️ stale since a failed fetch, set {_age(self.state.data.get('cookie_set_at'))}",
+        }[self.state.cookie_status]
+        lines = [
+            "<b>Status</b>",
+            f"cookie: {cookie_line}",
+            f"last successful fetch: {_age(self.state.data.get('last_successful_fetch'))}",
+            f"downloader: {'reachable' if healthy else '⚠️ unreachable'}",
+            f"media: {'streaming through the bot' if self.sender.streaming else 'CDN URL passthrough'}",
+            f"cache: {len(self.notes)} notes ({self.notes.hits} hit / {self.notes.misses} miss), "
+            f"{len(self.file_ids)} file ids",
+            f"allowlist: {len(self.state.allowlist)} user(s)",
+            f"watching: {len(self.state.groups)} group(s)",
+            *([f"xhs via: {escape(self.config.xhs_proxy)}"] if self.config.xhs_proxy else []),
+            *(
+                [
+                    f"channel: {escape(self.channel['title'])}"
+                    + (f" (@{self.channel['username']})" if self.channel["username"] else " (private)")
+                    + f", {len(self.state.data.get('published') or {})} published"
+                ]
+                if self.channel
+                else (["channel: ⚠️ configured but not usable"] if self.config.channel_id else [])
+            ),
+            f"uptime: {uptime // 3600}h {uptime % 3600 // 60}m",
+        ]
+        await self._reply(chat_id, "\n".join(lines))
+
+    # ---- admin -------------------------------------------------------
+
+    async def _handle_admin(self, chat_id: int, user_id: int, command: str, text: str) -> None:
+        if user_id != self.state.owner_id:
+            await self._reply(chat_id, "Owner only.")
+            return
+        if command == "/users":
+            listing = "\n".join(
+                f"• <code>{uid}</code>{' (owner)' if uid == self.state.owner_id else ''}"
+                for uid in self.state.allowlist
+            )
+            await self._reply(chat_id, f"<b>Allowlist</b>\n{listing}")
+            return
+        parts = text.split()
+        if len(parts) < 2 or not parts[1].lstrip("-").isdigit():
+            await self._reply(chat_id, f"Usage: <code>{command} &lt;telegram_user_id&gt;</code>")
+            return
+        target = int(parts[1])
+        if command == "/allow":
+            added = self.state.allow(target)
+            await self._reply(chat_id, f"{target} {'added' if added else 'was already on the list'}.")
+        else:
+            removed = self.state.deny(target)
+            await self._reply(
+                chat_id,
+                f"{target} removed." if removed else f"{target} is not removable (unknown, or the owner).",
+            )
+
+    # ---- the note flow (PLAN §4) -------------------------------------
+
+    def _warn_owner_cookieless(self) -> bool:
+        """True once per process, so a busy chat doesn't spam the owner."""
+        if self._told_owner_cookieless:
+            return False
+        self._told_owner_cookieless = True
+        return True
+
+    @contextlib.asynccontextmanager
+    async def _busy(self, chat_id: int, action: str = "upload_photo"):
+        """Hold a chat action up for as long as the work takes.
+
+        Telegram expires an action after ~5s, but a video note can take the
+        better part of a minute to fetch and stream through. Without a refresh
+        the user watches a silent chat and assumes the bot died.
+        """
+
+        async def beat() -> None:
+            while True:
+                await asyncio.sleep(self._beat_interval)
+                await self.tg.send_chat_action(chat_id, action)
+
+        # Fire the first one inline so the indicator is up before any awaiting.
+        await self.tg.send_chat_action(chat_id, action)
+        task = asyncio.create_task(beat())
+        try:
+            yield task
+        finally:
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+
+    async def _handle_link(
+        self,
+        chat_id: int | None,
+        message_id: int | None,
+        link: str,
+        user_id: int | None = None,
+        *,
+        announce_to: tuple[int, int | None] | None = None,
+    ) -> None:
+        """Fetch a note and deliver it.
+
+        `chat_id` is where the submitter is waiting — None for a group
+        submission, which produces no progress or error output at all.
+        `announce_to` is (chat, message) to tell about the finished post, which
+        for a group submission is the message that carried the link.
+        """
+        started = time.monotonic()
+        key = cache_key(link)
+        note = self.notes.get(key)
+        cached = note is not None
+        if note is None:
+            async with self._busy(chat_id) if chat_id else _nothing():
+                try:
+                    note = await self.xhs.detail(link, self.state.cookie)
+                except XhsError as exc:
+                    await self._handle_fetch_error(chat_id, message_id, exc, user_id)
+                    return
+            self.state.mark_fetch_success()
+            self.notes.put(key, note)
+            if note.note_id:
+                self.notes.put(note.note_id, note)
+
+        items = note.media(self.config.live_photos)
+        log.info(
+            "note %s: %s, %d media item(s)%s, requested by %s",
+            note.note_id or "?",
+            note.kind,
+            len(items),
+            " [cached]" if cached else "",
+            user_id or chat_id or "?",
+            extra=fields(
+                event="note",
+                note=note.note_id,
+                kind=note.kind,
+                items=len(items),
+                cached=cached,
+                origin="page" if note.from_page else "sidecar",
+            ),
+        )
+        if not items:
+            await self._reply(chat_id, "That note has no media I can send.", reply_to=message_id)
+            return
+
+        # In channel mode a link is a submission, so a resubmission should point
+        # at the existing post rather than duplicate it.
+        if self.channel:
+            already = self.state.published(note.note_id)
+            if already:
+                link_back = self.message_link(already["message_id"])
+                log.info(
+                    "note %s was already published: %s", note.note_id, link_back,
+                    extra=fields(event="duplicate", note=note.note_id, url=link_back),
+                )
+                where, in_reply_to = announce_to or (chat_id, message_id)
+                await self._reply(
+                    where,
+                    f'Already on the channel — <a href="{link_back}">see the post</a>.'
+                    if link_back
+                    else "That one is already on the channel.",
+                    reply_to=in_reply_to,
+                )
+                return
+
+        comments = await self._comments(note)
+        # Reading the page can turn up smaller renditions of an oversized
+        # video, so the album is rebuilt now that they are known. Without this
+        # the sender is handed items that were assembled before the fetch.
+        items = note.media(self.config.live_photos)
+
+        # A split album prefixes "[1/2] "; keep room so the caption still fits.
+        parts = -(-len(items) // MEDIA_GROUP_LIMIT)
+        marker = len(f"[{parts}/{parts}] ") if parts > 1 else 0
+        budget = CAPTION_LIMIT - marker
+        # The note's own text has first claim on the caption. Comments only get
+        # what it leaves — and if the text spills into a follow-up message at
+        # all, they move there wholesale rather than splitting the thread.
+        caption, overflow = build_caption(
+            note, tags=self.config.tags_in_caption, reserve=marker
+        )
+        # A post with a continuation carries a link to it, and that link needs
+        # room the note text would otherwise use. Comments count here even
+        # though they often end up fitting in the caption: whether they do is
+        # only known after the caption is built, and 16 units is a cheaper
+        # price than rebuilding twice.
+        continues = bool(overflow or comments or parts > 1)
+        if self.channel and continues:
+            caption, overflow = build_caption(
+                note, tags=self.config.tags_in_caption, reserve=marker + CONTINUED_COST
+            )
+        if overflow:
+            trailing = comments
+        else:
+            with_comments = fit_into_caption(caption, comments, limit=budget)
+            trailing = [] if with_comments != caption else comments
+            caption = with_comments
+
+        # Where the album goes: the channel if we're curating one, else back to
+        # whoever asked. A channel post can't reply to a user's message.
+        target = self.channel["id"] if self.channel else chat_id
+        if target is None:  # a group submission with nowhere to publish
+            return
+        reply_to = None if self.channel else message_id
+
+        action = "upload_video" if any(item.kind == "video" for item in items) else "upload_photo"
+        try:
+            async with self._busy(chat_id, action) if chat_id else _nothing():
+                report = await self.sender.send(target, items, caption, reply_to=reply_to)
+        except TelegramError as exc:
+            log.exception("send failed for note %s", note.note_id)
+            await self._reply(
+                chat_id,
+                ("The channel refused the post: " if self.channel else "Telegram refused the media: ")
+                + f"<code>{escape(exc.description)}</code>",
+                reply_to=message_id,
+            )
+            if self.channel:
+                await self._notify_owner(
+                    "⚠️ A submission could not be published to "
+                    f"<b>{escape(self.channel['title'])}</b>: "
+                    f"<code>{escape(exc.description)}</code>"
+                )
+            return
+
+        log.info(
+            "delivered %d item(s) in %.1fs via %s%s",
+            report.sent,
+            time.monotonic() - started,
+            "upload" if report.uploaded else "cached file_id/url",
+            f", skipped {len(report.skipped)}" if report.skipped else "",
+            extra=fields(
+                event="delivery",
+                note=note.note_id,
+                items=report.sent,
+                seconds=round(time.monotonic() - started, 1),
+                mode="upload" if report.uploaded else "url",
+                skipped=len(report.skipped),
+            ),
+        )
+        if report.skipped:
+            # The reasons used to go only to the submitter's chat, which a group
+            # submission does not have — so they went nowhere at all.
+            log.warning(
+                "note %s skipped %s", note.note_id or "?", "; ".join(report.skipped),
+                extra=fields(event="media_skipped", note=note.note_id, count=len(report.skipped)),
+            )
+        if not report.sent:
+            log.error(
+                "nothing was delivered for note %s", note.note_id or "?",
+                extra=fields(event="delivery_empty", note=note.note_id),
+            )
+            await self._reply(
+                chat_id,
+                "I couldn't send any of that note's media: "
+                + "; ".join(escape(s) for s in report.skipped),
+                reply_to=message_id,
+            )
+            return
+        # Everything else follows in the same chat, chained onto the post.
+        chain: list[tuple[int, str, bool]] = [(mid, cap, True) for mid, cap in report.parts]
+        previous = report.first_message_id
+        room = MESSAGE_LIMIT - (CONTINUED_COST if self.channel else 0)
+        for piece in self._follow_up(overflow, trailing, limit=room):
+            sent = await self._send_and_track(target, piece, reply_to=previous)
+            if sent:
+                chain.append((sent, piece, False))
+                previous = sent
+
+        # A reply chain is invisible once a message is forwarded out of the
+        # channel, so each message also carries a link to the next one.
+        if self.channel and len(chain) > 1:
+            await self._link_the_chain(target, chain)
+
+        if report.skipped:
+            await self._reply(chat_id, "Skipped: " + "; ".join(escape(s) for s in report.skipped))
+
+        if self.channel:
+            where, in_reply_to = announce_to or (chat_id, message_id)
+            await self._announce_published(where, in_reply_to, note, report)
+
+    @staticmethod
+    def _follow_up(overflow: str, comments: list, *, limit: int = MESSAGE_LIMIT) -> list[str]:
+        """Messages to send after the album: the rest of the text, then comments.
+
+        The comments ride in the *last* text message when they fit, so a note
+        that needed a second message doesn't also need a third.
+        """
+        pieces = [escape(piece) for piece in split_message(overflow, limit)] if overflow else []
+        if not comments:
+            return pieces
+        if pieces:
+            room = limit - tg_len(strip_tags(pieces[-1])) - 2
+            block = render_comments(comments, limit=room)
+            if block:
+                pieces[-1] = f"{pieces[-1]}\n\n{block}"
+                return pieces
+        block = render_comments(comments, limit=limit - 16)
+        if block:
+            pieces.append(block)
+        return pieces
+
+    async def _announce_published(
+        self, chat_id: int | None, message_id: int | None, note: Note, report
+    ) -> None:
+        """Tell the submitter where their entry landed."""
+        if not report.first_message_id:
+            # Nothing landed, so there is nothing to point at and nothing to
+            # remember. Saying "published" here would be a lie.
+            log.error("no message id for note %s; not recording it", note.note_id or "?")
+            return
+        link = self.message_link(report.first_message_id)
+        self.state.record_published(note.note_id, self.channel["id"], report.first_message_id)
+        log.info(
+            "published %s to %s: %s",
+            note.note_id or "?",
+            self.channel["title"],
+            link or f"message {report.first_message_id}",
+            extra=fields(
+                event="published", note=note.note_id, message_id=report.first_message_id, url=link
+            ),
+        )
+        title = escape(self.channel["title"])
+        if link:
+            body = f'Published to <b>{title}</b> — <a href="{link}">see the post</a>.'
+        else:
+            body = f"Published to <b>{title}</b>."
+        await self._reply(chat_id, body, reply_to=message_id)
+
+    async def _comments(self, note: Note) -> list:
+        """Top comments for the caption. A failed scrape never fails a note."""
+        if not self.config.comments:
+            return []
+        try:
+            comments = await self.xhs.enrich(note, self.config.comments)
+        except Exception:  # a garnish is not worth failing a delivery over
+            log.exception("comment scrape failed for note %s", note.note_id)
+            return []
+        log.info(
+            "comments for %s: %d fetched", note.note_id or "?", len(comments),
+            extra=fields(event="comments", note=note.note_id, count=len(comments)),
+        )
+        return comments
+
+    async def _handle_fetch_error(
+        self, chat_id: int, message_id: int | None, exc: XhsError, user_id: int | None = None
+    ) -> None:
+        # Without this the user sees an error and the log shows nothing at all.
+        log.warning(
+            "fetch failed (%s): %s", exc.kind, exc,
+            extra=fields(event="fetch_failed", kind=exc.kind, detail=str(exc)[:200]),
+        )
+        if exc.kind == "profile":
+            await self._reply(
+                chat_id,
+                "That's someone's profile, not a note. Open the note you want and share "
+                "that link instead.",
+                reply_to=message_id,
+            )
+            return
+        if exc.kind == "bad_link":
+            await self._reply(chat_id, "I couldn't read a note link out of that.", reply_to=message_id)
+            return
+        if exc.kind == "network":
+            await self._reply(chat_id, "The downloader sidecar isn't answering. Try again shortly.")
+            return
+        if exc.kind == "empty":
+            await self._reply(chat_id, "That note came back without any media.", reply_to=message_id)
+            return
+
+        # "blocked": login wall, expired cookie, or rate limiting (PLAN §7).
+        if not self.state.cookie:
+            # Nothing to go stale — say what would actually fix it instead of
+            # leaving the user to guess.
+            await self._reply(
+                chat_id,
+                "XHS refused that fetch. I'm running <b>without a cookie</b>, and some notes "
+                "are only readable when signed in — a cookie would likely fix this one.\n\n"
+                + (
+                    COOKIE_INSTRUCTIONS
+                    if user_id == self.state.owner_id
+                    else "Ask the bot's owner to add one."
+                ),
+                reply_to=message_id,
+            )
+            if user_id != self.state.owner_id and self._warn_owner_cookieless():
+                await self._notify_owner(
+                    "⚠️ A fetch was refused and I have <b>no cookie</b> stored. Some notes need "
+                    "one.\n\n" + COOKIE_INSTRUCTIONS
+                )
+            return
+
+        await self._reply(
+            chat_id,
+            "XHS refused that fetch — login wall, expired cookie, or rate limiting.",
+            reply_to=message_id,
+        )
+        if self.state.mark_cookie_stale():
+            await self._notify_owner(
+                "⚠️ A fetch was refused, so I've marked the stored cookie <b>stale</b>.\n\n"
+                + COOKIE_INSTRUCTIONS
+            )
+        elif not self.state.cookie and not self._warned_cookieless:
+            self._warned_cookieless = True
+            await self._notify_owner(
+                "⚠️ An unauthenticated fetch was refused. Setting a cookie may help.\n\n"
+                + COOKIE_INSTRUCTIONS
+            )
+
+    # ---- plumbing ----------------------------------------------------
+
+    async def _notify_owner(self, text: str) -> None:
+        if self.state.owner_id:
+            await self._reply(self.state.owner_id, text)
+
+    async def _reply(
+        self, chat_id: int | str | None, text: str, *, reply_to: int | None = None
+    ) -> None:
+        # A group submission has no one to answer: everything the bot would
+        # have said is simply not said (and never leaks into the group).
+        if chat_id is None:
+            return
+        try:
+            await self.tg.send_message(chat_id, text, reply_to=reply_to)
+        except TelegramError as exc:
+            if reply_to and "reply message not found" in exc.description.lower():
+                await self.tg.send_message(chat_id, text)
+                return
+            log.error("could not reply to %s: %s", chat_id, exc.description)
+
+    async def aclose(self) -> None:
+        await self.sender.aclose()

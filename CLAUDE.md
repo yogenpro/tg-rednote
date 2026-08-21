@@ -246,10 +246,18 @@ someone else's photo with the opening author's words — the same misattribution
 bound exists to prevent. `oss.1p3a.com` is public: 200 with no cookie and no referer, so
 Telegram fetches it directly.
 
-**The site is DM-only, and that is enforced in two places.** `_handle_group_message` returns
-before it ever looks for a thread link, and there is no channel path at all — no submission,
-no dedupe, no announcement. Threads are long, often half-paywalled, and the channel is for
-RedNote.
+**1point3acres runs the same three paths RedNote does** — DM, watched group, channel — since
+2026-08-21. It was DM-only at first on the reasoning that threads are long, often half
+paywalled, and the channel was for notes; publishing to telegra.ph removed the length
+objection and the owner asked for it. `_handle_group_message` routes either kind of link, and
+`_handle_acres_link` takes the same `chat_id=None` silent path and `announce_to` permalink
+that `_handle_link` does. One thing to keep in mind: a telegra.ph page is public to anyone
+holding the link, so a channel post republishes a thread past the channel's own membership.
+
+**The dedupe index is shared between the two sites, so forum ids are namespaced** `1p3a:<tid>`
+(`acres_key`). A tid is a short number and a note id a long hex string, so a collision is not
+realistic — but an index that cannot say which site a key belongs to is the kind of thing that
+produces one baffling bug years later.
 
 **Two cookies now, and the order they are matched in matters.** A 1point3acres cookie carries
 `_gid=`, and the RedNote matcher accepts anything containing `gid=`, so the forum check runs

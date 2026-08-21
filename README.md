@@ -153,9 +153,11 @@ stay with that reply.
 **Telegraph pages are public to anyone with the link.** That is the point of the feature, and
 also why it is nowhere near the group and channel paths.
 
-**This works in a DM and nowhere else.** A thread link posted in a watched group is ignored,
-and nothing is ever published to the channel. Forum posts are long, frequently half-hidden
-behind the site's points wall, and a channel of them is not what channel mode is for.
+Thread links work everywhere note links do: in a DM, in a watched group, and on the channel.
+**Note that a telegra.ph page is public to anyone with the link**, so publishing a thread to a
+channel puts it somewhat further afield than the channel's own membership. Set `ACRES=false`
+to turn the feature off entirely, or `ACRES_TELEGRAPH=false` to keep threads inside Telegram
+as chunked messages.
 
 The site runs a Cloudflare managed challenge across the whole domain, so unlike RedNote there
 is no anonymous mode — it needs your browser's session before it will fetch anything:

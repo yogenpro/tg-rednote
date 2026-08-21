@@ -709,24 +709,78 @@ async def test_the_page_carries_the_post_the_replies_and_the_way_home(tmp_path):
         assert expected in blob, expected
 
 
-@pytest.mark.asyncio
-async def test_a_group_never_hears_about_a_thread_link(tmp_path):
-    bot, telegram, state = acres_bot(tmp_path)
+def group_message(text, *, chat=-100, user=1, message_id=5):
+    return {
+        "update_id": 1,
+        "message": {
+            "message_id": message_id,
+            "from": {"id": user},
+            "chat": {"id": chat, "type": "supergroup"},
+            "text": text,
+        },
+    }
+
+
+def with_channel(bot, state):
     state.allow_group(-100, "g", 1)
-    bot.channel = {"id": -200, "username": "c", "title": "C"}
-    await bot.handle_update(
-        {
-            "update_id": 1,
-            "message": {
-                "message_id": 5,
-                "from": {"id": 1},
-                "chat": {"id": -100, "type": "supergroup"},
-                "text": LINK,
-            },
-        }
-    )
-    assert telegram.sent == []
-    assert bot.acres.calls == []
+    bot.channel = {"id": -200, "username": "chan", "title": "C"}
+    return bot
+
+
+@pytest.mark.asyncio
+async def test_a_thread_from_a_group_is_published_and_answered_with_a_permalink(tmp_path):
+    paper = FakeTelegraph()
+    bot, telegram, state = acres_bot(tmp_path, telegraph=paper)
+    with_channel(bot, state)
+    await bot.handle_update(group_message(LINK))
+
+    posted = [(chat, text) for chat, text in telegram.sent if chat == -200]
+    answered = [(chat, text) for chat, text in telegram.sent if chat == -100]
+    assert len(posted) == 1 and "telegra.ph" in posted[0][1]
+    assert len(answered) == 1 and "https://t.me/chan/" in answered[0][1]
+
+
+@pytest.mark.asyncio
+async def test_a_group_hears_nothing_when_the_fetch_fails(tmp_path):
+    bot, telegram, state = acres_bot(tmp_path, error=AcresError("challenge", "cf"))
+    with_channel(bot, state)
+    await bot.handle_update(group_message(LINK))
+    # Not a word in the group, and no DevTools lecture either.
+    assert [chat for chat, _t in telegram.sent if chat == -100] == []
+
+
+@pytest.mark.asyncio
+async def test_a_resubmitted_thread_points_at_the_post_that_exists(tmp_path):
+    paper = FakeTelegraph()
+    bot, telegram, state = acres_bot(tmp_path, telegraph=paper)
+    with_channel(bot, state)
+    await bot.handle_update(group_message(LINK))
+    await bot.handle_update(group_message(LINK, message_id=6))
+
+    assert len(paper.pages) == 1  # not published twice
+    assert "Already on the channel" in telegram.texts
+
+
+def test_the_dedupe_index_says_which_site_an_id_came_from(tmp_path):
+    """One index, two sites. A forum tid is a short number and a note id a long
+    hex string, but sharing the index without namespacing invites exactly one
+    very confusing bug."""
+    from app.handlers import acres_key
+
+    assert acres_key("1186859") == "1p3a:1186859"
+    assert acres_key("") == ""
+
+
+@pytest.mark.asyncio
+async def test_a_thread_and_a_note_with_the_same_id_do_not_collide(tmp_path):
+    paper = FakeTelegraph()
+    bot, telegram, state = acres_bot(tmp_path, telegraph=paper)
+    with_channel(bot, state)
+    # A note already published under the bare id.
+    state.record_published("1186859", -200, 42)
+    await bot.handle_update(group_message(LINK))
+    assert len(paper.pages) == 1  # the thread is still new
+    assert "Already on the channel" not in telegram.texts
 
 
 @pytest.mark.asyncio

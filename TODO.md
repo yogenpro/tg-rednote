@@ -100,7 +100,8 @@ notes (images, Ultra-HDR albums, videos, forwarded messages, `.com` and `.cn` li
   `<font class="jammer">` interference and zero-width characters stripped, GBK decoded,
   points-walled gaps marked `[…]`, and its own cookie custody (`/acres`, which accepts a
   "Copy as cURL" paste so `cf_clearance` keeps the User-Agent it was issued for). DM-only by
-  construction: no group path, no channel path.
+  construction at first; opened to groups and the channel later the same day at the owner's
+  request, once telegra.ph had removed the "threads are too long for a channel" objection.
 
 - Group listening and dedupe, both confirmed live on 2026-08-21: a real group has been
   publishing submissions silently for a day, and a note resubmitted there by a second user

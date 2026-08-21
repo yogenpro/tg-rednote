@@ -48,8 +48,8 @@ HELP = """<b>RedNote → Telegram</b>
 
 Send me a Xiaohongshu share link and I'll post the note back as native media.
 
-A <b>1point3acres</b> thread link works here too — in this chat only — and comes \
-back as text with whatever images the post carries.
+A <b>1point3acres</b> thread link works too: it comes back as a single page with the \
+post, its pictures and the top replies.
 
 /status — cookie age, last successful fetch, sidecar health
 /cookie &lt;value&gt; — set the XHS cookie (the message is deleted on receipt)
@@ -67,6 +67,11 @@ OWNER_HELP = HELP + """
 # caption room, which the note's own text would rather have.
 # 1point3acres scores a post with 好苗/杂草 — a thumbs up, not a heart.
 ACRES_LIKE = "👍"
+
+
+def acres_key(tid: str) -> str:
+    """The dedupe index is shared with RedNote, so a forum id says so."""
+    return f"1p3a:{tid}" if tid else ""
 
 
 def _page_message(thread: Thread, page: str) -> str:
@@ -267,30 +272,33 @@ class Bot:
             return
         candidates = message_candidates(message)
         link = next((found for found in map(find_link, candidates) if found), None)
-        if not link:
-            # 1point3acres is deliberately DM-only: threads are long, often
-            # partly paywalled, and the channel is for RedNote. A link to one
-            # here is ignored in silence like anything else.
+        thread = next((found for found in map(find_acres_link, candidates) if found), None)
+        if not link and not (thread and self.acres):
             return
         if not self.channel:
             log.info("ignoring a link from %s: no channel configured", chat.get("title"))
             return
         current_rid.set(new_rid())
+        site = "" if link else "1p3a"
         log.info(
             "submission from group %s (%s): %s",
             chat.get("title") or chat_id,
             (message.get("from") or {}).get("id"),
-            link,
-            extra=fields(event="submission", source="group", group=chat_id),
+            link or thread,
+            extra=fields(
+                event="submission", source="group", group=chat_id,
+                **({"site": site} if site else {}),
+            ),
         )
         # No reply chat: progress and failures stay out of the group entirely.
         # The finished post is the exception — it goes back as a reply to the
         # message that offered the link, so whoever shared it can see where it
         # landed.
-        await self._handle_link(
+        handle = self._handle_link if link else self._handle_acres_link
+        await handle(
             None,
             None,
-            link,
+            link or thread,
             (message.get("from") or {}).get("id"),
             announce_to=(chat_id, message.get("message_id")),
         )
@@ -329,11 +337,18 @@ class Bot:
         )
 
     async def _send_and_track(
-        self, chat_id: int | str, text: str, *, reply_to: int | None = None
+        self,
+        chat_id: int | str,
+        text: str,
+        *,
+        reply_to: int | None = None,
+        preview: bool = False,
     ) -> int | None:
         """Like _reply, but hands back the message id so it can be linked to."""
         try:
-            sent = await self.tg.send_message(chat_id, text, reply_to=reply_to)
+            sent = await self.tg.send_message(
+                chat_id, text, reply_to=reply_to, preview=preview
+            )
         except TelegramError as exc:
             log.error("could not post a follow-up to %s: %s", chat_id, exc.description)
             return None
@@ -612,19 +627,26 @@ class Bot:
         )
 
     async def _handle_acres_link(
-        self, chat_id: int, message_id: int | None, link: str, user_id: int | None = None
+        self,
+        chat_id: int | None,
+        message_id: int | None,
+        link: str,
+        user_id: int | None = None,
+        *,
+        announce_to: tuple[int, int | None] | None = None,
     ) -> None:
-        """Fetch a forum thread and deliver it to the DM it came from.
+        """Fetch a forum thread and deliver it.
 
-        Unlike the note flow this never touches the channel: the site is
-        DM-only, so there is no submission, no dedupe and no announcement.
+        Same contract as the note flow: `chat_id` is where the submitter is
+        waiting — None for a group submission, which produces no progress and
+        no errors — and `announce_to` is who to tell about the finished post.
         """
         started = time.monotonic()
         key = thread_id(link) or link
         thread = self.threads.get(key)
         cached = thread is not None
         if thread is None:
-            async with self._busy(chat_id, "typing"):
+            async with self._busy(chat_id, "typing") if chat_id else _nothing():
                 try:
                     thread = await self.acres.thread(
                         link, self.state.acres_cookie, self.state.acres_ua
@@ -659,11 +681,44 @@ class Bot:
             ),
         )
 
+        # In channel mode a link is a submission, so a resubmission points at
+        # the existing post. The key is namespaced: a forum tid is a short
+        # number and a note id a long hex string, but sharing one index between
+        # two sites without saying which is which invites exactly one very
+        # confusing bug.
+        published_key = acres_key(thread.tid)
+        if self.channel:
+            already = self.state.published(published_key)
+            if already:
+                link_back = self.message_link(already["message_id"])
+                log.info(
+                    "thread %s was already published: %s", thread.tid, link_back,
+                    extra=fields(
+                        event="duplicate", site="1p3a", note=thread.tid, url=link_back
+                    ),
+                )
+                where, in_reply_to = announce_to or (chat_id, message_id)
+                await self._reply(
+                    where,
+                    f'Already on the channel — <a href="{link_back}">see the post</a>.'
+                    if link_back
+                    else "That one is already on the channel.",
+                    reply_to=in_reply_to,
+                )
+                return
+
+        # Where it goes: the channel if we are curating one, else back to
+        # whoever asked. A channel post cannot reply to a user's message.
+        target = self.channel["id"] if self.channel else chat_id
+        if target is None:  # a group submission with nowhere to publish
+            return
+        reply_to = None if self.channel else message_id
+
         if self.telegraph:
             page = await self._publish_page(thread)
             if page:
-                await self._reply(
-                    chat_id, _page_message(thread, page), reply_to=message_id, preview=True
+                sent = await self._send_and_track(
+                    target, _page_message(thread, page), reply_to=reply_to, preview=True
                 )
                 log.info(
                     "delivered thread %s as %s in %.1fs",
@@ -674,6 +729,11 @@ class Bot:
                         seconds=round(time.monotonic() - started, 1),
                     ),
                 )
+                if self.channel:
+                    where, in_reply_to = announce_to or (chat_id, message_id)
+                    await self._announce_published(
+                        where, in_reply_to, published_key, sent, site="1p3a"
+                    )
                 return
             # Falling through on purpose: a telegra.ph outage should cost the
             # nicer format, not the thread.
@@ -696,13 +756,13 @@ class Bot:
             trailing = [] if with_replies != head else thread.comments
             head = with_replies
 
+        first: int | None = None
         previous: int | None = None
         if items:
-            action = "upload_photo"
             try:
-                async with self._busy(chat_id, action):
+                async with self._busy(chat_id, "upload_photo") if chat_id else _nothing():
                     report = await self.acres_sender.send(
-                        chat_id, items, head, reply_to=message_id
+                        target, items, head, reply_to=reply_to
                     )
             except TelegramError as exc:
                 log.exception("send failed for thread %s", thread.tid)
@@ -725,12 +785,13 @@ class Bot:
             else:
                 # The text is the point of a forum post; images failing must not
                 # take it down with them.
-                previous = await self._send_and_track(chat_id, head, reply_to=message_id)
+                previous = await self._send_and_track(target, head, reply_to=reply_to)
         else:
-            previous = await self._send_and_track(chat_id, head, reply_to=message_id)
+            previous = await self._send_and_track(target, head, reply_to=reply_to)
+        first = previous
 
         for piece in self._follow_up(overflow, trailing, limit=MESSAGE_LIMIT, like=ACRES_LIKE):
-            sent = await self._send_and_track(chat_id, piece, reply_to=previous)
+            sent = await self._send_and_track(target, piece, reply_to=previous)
             previous = sent or previous
 
         # Pictures that belong to replies rather than to the post, in an album
@@ -738,9 +799,9 @@ class Bot:
         gallery, gallery_caption = reply_gallery(thread.comments)
         if gallery:
             try:
-                async with self._busy(chat_id, "upload_photo"):
+                async with self._busy(chat_id, "upload_photo") if chat_id else _nothing():
                     await self.acres_sender.send(
-                        chat_id,
+                        target,
                         [MediaItem("photo", url) for url in gallery],
                         gallery_caption,
                         reply_to=previous,
@@ -766,6 +827,9 @@ class Bot:
                 seconds=round(time.monotonic() - started, 1),
             ),
         )
+        if self.channel:
+            where, in_reply_to = announce_to or (chat_id, message_id)
+            await self._announce_published(where, in_reply_to, published_key, first, site="1p3a")
 
     async def _publish_page(self, thread: Thread) -> str | None:
         """The thread as one Telegraph page, or None if that did not work out.
@@ -1219,7 +1283,9 @@ class Bot:
 
         if self.channel:
             where, in_reply_to = announce_to or (chat_id, message_id)
-            await self._announce_published(where, in_reply_to, note, report)
+            await self._announce_published(
+                where, in_reply_to, note.note_id, report.first_message_id
+            )
 
     @staticmethod
     def _follow_up(
@@ -1245,23 +1311,30 @@ class Bot:
         return pieces
 
     async def _announce_published(
-        self, chat_id: int | None, message_id: int | None, note: Note, report
+        self,
+        chat_id: int | None,
+        message_id: int | None,
+        key: str,
+        first_message_id: int | None,
+        *,
+        site: str = "",
     ) -> None:
         """Tell the submitter where their entry landed."""
-        if not report.first_message_id:
+        if not first_message_id:
             # Nothing landed, so there is nothing to point at and nothing to
             # remember. Saying "published" here would be a lie.
-            log.error("no message id for note %s; not recording it", note.note_id or "?")
+            log.error("no message id for %s; not recording it", key or "?")
             return
-        link = self.message_link(report.first_message_id)
-        self.state.record_published(note.note_id, self.channel["id"], report.first_message_id)
+        link = self.message_link(first_message_id)
+        self.state.record_published(key, self.channel["id"], first_message_id)
         log.info(
             "published %s to %s: %s",
-            note.note_id or "?",
+            key or "?",
             self.channel["title"],
-            link or f"message {report.first_message_id}",
+            link or f"message {first_message_id}",
             extra=fields(
-                event="published", note=note.note_id, message_id=report.first_message_id, url=link
+                event="published", note=key, message_id=first_message_id, url=link,
+                **({"site": site} if site else {}),
             ),
         )
         title = escape(self.channel["title"])

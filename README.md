@@ -1,5 +1,8 @@
 # RedNote → Telegram
 
+[![tests](https://github.com/yogenpro/tg-rednote/actions/workflows/tests.yml/badge.svg)](https://github.com/yogenpro/tg-rednote/actions/workflows/tests.yml)
+[![publish](https://github.com/yogenpro/tg-rednote/actions/workflows/publish.yml/badge.svg)](https://github.com/yogenpro/tg-rednote/actions/workflows/publish.yml)
+
 A self-hosted Telegram bot. Share a Xiaohongshu (RedNote) link with it; it replies with the
 note's images or video and its text, as native Telegram media.
 
@@ -372,14 +375,23 @@ The tag is pinned deliberately — the API surface moved between releases (`main
 config, the event vocabulary and the queries worth keeping. Cookie values are never logged, including in
 tracebacks, and message text is only logged with `DEBUG_UPDATES=true`.
 
+**Prebuilt image.** Every push to `main` publishes a multi-arch image (amd64 and arm64, so a
+Raspberry Pi works) to the GitHub Container Registry:
+
+```bash
+docker compose pull bot && docker compose up -d    # skips the local build
+```
+
+Tags: `latest` tracks `main`, `sha-<commit>` pins an exact build, and `vX.Y.Z` appears when a
+release is tagged.
+
 **Running without Compose.** The image carries working defaults, so it needs only a token and
 somewhere to reach the sidecar:
 
 ```bash
-docker build -t tg-rednote ./bot
 docker run -d --name xhs-bot --restart unless-stopped \
   -e TG_BOT_TOKEN=… -e XHS_DOWNLOADER_URL=http://your-sidecar:5556 \
-  -v xhs-bot-state:/data tg-rednote
+  -v xhs-bot-state:/data ghcr.io/yogenpro/tg-rednote:latest
 ```
 
 **Building against a remote Docker host** (`docker --context …`) works, but the `./xhs-volume`

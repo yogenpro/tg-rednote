@@ -68,8 +68,10 @@ services:
     logging: *logging
 
   bot:
+    # Built locally by default. To use the published image instead and skip the
+    # build, run `docker compose pull bot` first — same tag either way.
     build: ./bot
-    image: tg-rednote:latest
+    image: ghcr.io/yogenpro/tg-rednote:latest
     container_name: xhs-bot
     restart: unless-stopped
     env_file:

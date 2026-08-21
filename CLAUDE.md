@@ -52,6 +52,16 @@ domain the link arrived on. That is not tidiness: an account lives on one domain
 process makes are the ones that meet the walls. Sharing a rednote.com link is therefore what
 makes a rednote.com session apply.
 
+**One site, two front doors, and not one gate.** A page refused on one domain is worth exactly
+one retry on the other: measured with a valid `xsec_token`, xiaohongshu.com answered the
+security wall 5/5 while rednote.com served the same note 5/5, order randomised — and recovering
+a walled page live then produced 5 comments and a full note where there had been none.
+`XhsDownloader._page` does that retry for both callers (`enrich` and `from_page`), triggered by
+a wall *or* by a 200 with no note behind it, which is the same thing wearing a different hat.
+It costs one extra request and only on failure; a page that works is fetched once. The sidecar
+gets no such fallback — it rejects rednote.com outright — so this is purely for the requests
+this process makes.
+
 **Resolve short links here, not in the sidecar.** The sidecar's own resolver intermittently
 returns `提取小红书作品链接失败` for `xhslink.com` links that redirect fine from this process.
 `XhsDownloader.resolve()` follows short links with browser headers and hands the sidecar a

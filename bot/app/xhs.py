@@ -128,6 +128,24 @@ def _normalise_host(url: str) -> str:
     )
 
 
+def sibling_host(url: str) -> str:
+    """The other domain serving the same note.
+
+    xiaohongshu.com and rednote.com are one site with two front doors, and
+    measurably not one gate: with a valid xsec_token, xiaohongshu.com answered
+    the security wall five times out of five while rednote.com served the same
+    note five out of five, order randomised. A refusal on one is therefore
+    worth exactly one retry on the other.
+    """
+    if _REDNOTE_RE.match(url):
+        return re.sub(
+            r"^(https?://)(?:www\.)?rednote\.com", r"\1www.xiaohongshu.com", url, flags=re.IGNORECASE
+        )
+    return re.sub(
+        r"^(https?://)(?:www\.)?xiaohongshu\.com", r"\1www.rednote.com", url, flags=re.IGNORECASE
+    )
+
+
 def page_url_for(sidecar_url: str, shared: str) -> str:
     """Where to read the note *page* from.
 
@@ -291,6 +309,15 @@ def _page_state(html: str) -> dict:
     return _state(html) or {}
 
 
+def _usable(html: str) -> bool:
+    """Did this page actually come with a note on it?
+
+    A wall answers 200 with parseable markup, so "the request worked" is not
+    the same question.
+    """
+    return bool(((_page_state(html).get("noteData") or {}).get("data") or {}).get("noteData"))
+
+
 class XhsDownloader:
     def __init__(self, base_url: str, timeout: float = 120.0, proxy: str = ""):
         """`proxy` covers XHS itself, never the sidecar.
@@ -358,6 +385,41 @@ class XhsDownloader:
             log.info("resolved %s -> %s", url.split("?")[0], resolved.split("?")[0])
         return resolved
 
+    async def _page(self, url: str, timeout: float | None = None) -> tuple[str, str] | None:
+        """Fetch a note page, falling back to the sibling domain.
+
+        Returns (html, final url), or None when neither domain served it. The
+        retry costs one request and only on failure — and it is the difference
+        between a note being readable and not, whenever one domain is walling
+        this IP and the other is not.
+        """
+        candidates = [url, sibling_host(url)]
+        for attempt, candidate in enumerate(candidates):
+            if attempt and candidate == candidates[0]:
+                break  # not one of the two known domains; nothing to fall back to
+            try:
+                response = await self._client.get(
+                    candidate, follow_redirects=True, timeout=timeout
+                )
+                response.raise_for_status()
+            except httpx.HTTPError as exc:
+                log.info("no page at %s: %s", candidate.split("?")[0], type(exc).__name__)
+                continue
+            if _usable(response.text) and not is_wall(str(response.url)):
+                if attempt:
+                    log.info(
+                        "%s served the page %s would not", candidate.split("/")[2],
+                        candidates[0].split("/")[2],
+                        extra=fields(event="sibling_domain", host=candidate.split("/")[2]),
+                    )
+                return response.text, str(response.url)
+            log.info(
+                "the page at %s was walled or empty%s", candidate.split("?")[0],
+                "" if attempt else "; trying the other domain",
+                extra=fields(event="page_walled", host=candidate.split("/")[2]),
+            )
+        return None
+
     async def enrich(self, note: Note, limit: int = 5) -> list:
         """Read the note's page once: top comments, and the video's renditions.
 
@@ -371,27 +433,17 @@ class XhsDownloader:
 
         if not note.page_url:
             return []
-        try:
-            response = await self._client.get(note.page_url, follow_redirects=True,
-                                              timeout=self._comment_timeout)
-            response.raise_for_status()
-        except httpx.HTTPError as exc:
-            log.info("no page for %s: %s", note.page_url.split("?")[0], type(exc).__name__)
-            return []
-
-        if is_wall(str(response.url)):
-            # HTTP 200 with a wall behind it. Left unsaid, this looks exactly
-            # like a note that simply has no comments and no other rendition,
-            # which is a very different problem.
+        fetched = await self._page(note.page_url, self._comment_timeout)
+        if not fetched:
             log.warning(
-                "the page for %s was walled (%s)", note.note_id or "?",
-                str(response.url).split("?")[0],
-                extra=fields(event="page_walled", note=note.note_id),
+                "no page for %s on either domain", note.note_id or "?",
+                extra=fields(event="page_unavailable", note=note.note_id),
             )
             return []
+        html, _final = fetched
 
         if note.kind == "video" and not note.video_variants:
-            state = _page_state(response.text)
+            state = _page_state(html)
             data = ((state.get("noteData") or {}).get("data") or {}).get("noteData") or {}
             note.video_variants = video_variants(data.get("video") or {})
             log.info(
@@ -402,7 +454,7 @@ class XhsDownloader:
                     event="renditions", note=note.note_id, count=len(note.video_variants)
                 ),
             )
-        return parse_comments(response.text, limit=limit)
+        return parse_comments(html, limit=limit)
 
     async def healthy(self) -> bool:
         try:
@@ -472,14 +524,12 @@ class XhsDownloader:
         """
         from .page import parse_note_page
 
-        try:
-            response = await self._client.get(url, follow_redirects=True)
-            response.raise_for_status()
-        except httpx.HTTPError as exc:
-            log.info("page fallback could not load %s: %s", url.split("?")[0], type(exc).__name__)
+        fetched = await self._page(url)
+        if not fetched:
             return None
-        note = parse_note_page(response.text, url)
+        html, final = fetched
+        note = parse_note_page(html, final)
         if not note or not note.media("both"):
             return None
-        note.page_url = url
+        note.page_url = final
         return note

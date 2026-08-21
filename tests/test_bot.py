@@ -113,6 +113,123 @@ def test_unwrap_login_wall():
     assert _unwrap_login_wall(plain) == plain
 
 
+def test_sibling_host_swaps_both_ways():
+    from app.xhs import sibling_host
+
+    assert sibling_host("https://www.xiaohongshu.com/explore/1?t=2") == (
+        "https://www.rednote.com/explore/1?t=2"
+    )
+    assert sibling_host("https://www.rednote.com/explore/1") == (
+        "https://www.xiaohongshu.com/explore/1"
+    )
+
+
+def _served_note_page(note_id: str = "650a", comments: int = 2) -> str:
+    """A page carrying the state blob the scrapers read."""
+    import json
+
+    state = {
+        "noteData": {
+            "data": {
+                "noteData": {"noteId": note_id, "type": "normal", "title": "T", "desc": "d",
+                             "imageList": [{"url": "https://cdn/1"}], "user": {}},
+                "commentData": {
+                    "comments": [
+                        {"content": f"c{i}", "user": {"nickname": "n"}} for i in range(comments)
+                    ]
+                },
+            }
+        }
+    }
+    return "<html><script>window.__INITIAL_STATE__=" + json.dumps(state) + "</script></html>"
+
+
+@pytest.mark.asyncio
+async def test_a_walled_domain_falls_back_to_its_sibling():
+    """The two domains are one site but not one gate: with a valid token,
+    xiaohongshu.com answered the wall 5/5 while rednote.com served 5/5."""
+    import httpx
+
+    from app.xhs import Note, XhsDownloader
+
+    seen = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request.url.host)
+        if request.url.host == "www.xiaohongshu.com":
+            # A wall: HTTP 200, parseable, and no note behind it.
+            return httpx.Response(
+                200, request=request,
+                html="<html>nope</html>",
+                headers={"location": ""},
+            )
+        return httpx.Response(200, request=request, html=_served_note_page())
+
+    downloader = XhsDownloader("http://sidecar", timeout=5)
+    downloader._client = httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), follow_redirects=True
+    )
+    note = Note(note_id="650a", kind="image",
+                page_url="https://www.xiaohongshu.com/explore/650a")
+    comments = await downloader.enrich(note, 5)
+    await downloader._client.aclose()
+
+    assert seen == ["www.xiaohongshu.com", "www.rednote.com"]
+    assert len(comments) == 2  # recovered off the sibling
+
+
+@pytest.mark.asyncio
+async def test_a_page_that_works_costs_only_one_request():
+    import httpx
+
+    from app.xhs import Note, XhsDownloader
+
+    seen = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request.url.host)
+        return httpx.Response(200, request=request, html=_served_note_page())
+
+    downloader = XhsDownloader("http://sidecar", timeout=5)
+    downloader._client = httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), follow_redirects=True
+    )
+    note = Note(note_id="650a", kind="image",
+                page_url="https://www.xiaohongshu.com/explore/650a")
+    await downloader.enrich(note, 5)
+    await downloader._client.aclose()
+
+    assert seen == ["www.xiaohongshu.com"]  # no speculative second fetch
+
+
+@pytest.mark.asyncio
+async def test_both_domains_walled_gives_up_rather_than_looping():
+    import httpx
+
+    from app.xhs import Note, XhsDownloader
+
+    seen = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request.url.host)
+        return httpx.Response(200, request=request, html="<html>nope</html>")
+
+    downloader = XhsDownloader("http://sidecar", timeout=5)
+    downloader._client = httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), follow_redirects=True
+    )
+    note = Note(note_id="650a", kind="image",
+                page_url="https://www.xiaohongshu.com/explore/650a")
+    assert await downloader.enrich(note, 5) == []
+    assert await downloader.from_page("https://www.rednote.com/explore/650a") is None
+    await downloader._client.aclose()
+
+    assert seen == [
+        "www.xiaohongshu.com", "www.rednote.com",  # enrich
+        "www.rednote.com", "www.xiaohongshu.com",  # from_page, starting the other side
+    ]
+
+
 def test_rednote_com_is_the_same_site_and_must_be_recognised():
     """The international domain. It serves the identical note page, but the
     sidecar rejects it outright (提取小红书作品链接失败), so it is normalised for

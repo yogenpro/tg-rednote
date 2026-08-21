@@ -83,7 +83,9 @@ and paste it in. Pasting the whole Chinese share blurb is fine; the link gets pi
 ---
 
 **`rednote.com` links work too.** It is the same site under its international name, and it
-serves the same notes. If your account is on rednote.com rather than xiaohongshu.com, share
+serves the same notes — and usefully, not always at the same moment: when one domain walls a
+page fetch, the bot retries the other, which recovers notes that would otherwise come back
+without comments or without a video's smaller renditions. If your account is on rednote.com rather than xiaohongshu.com, share
 the rednote.com form of a link: the bot's own page fetches follow the domain you shared, so
 that is what makes a rednote.com session apply. (The downloader sidecar only speaks
 xiaohongshu.com, so that hop is rewritten for it either way.)

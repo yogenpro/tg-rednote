@@ -165,6 +165,15 @@ replies chronologically and offers no popularity order (`ordertype=1` only rever
 Quotes come out of a reply's text (they repeat a post already on screen) but the quoted name
 is kept as `replying_to`, or the answer reads as a non-sequitur.
 
+**A reply's picture is delivered under the reply's name, not the post's.** Replies carry
+attachments in exactly the same `pattl` shape the opening post does, so `parse_replies`
+collects them per comment; the comment then renders a 📷 link (markup and href are free
+against Telegram's limit, so the marker costs two units however long the URL is) and the
+pictures travel as a *separate* album after the text. Joining the post's album would caption
+someone else's photo with the opening author's words — the same misattribution the post-extent
+bound exists to prevent. `oss.1p3a.com` is public: 200 with no cookie and no referer, so
+Telegram fetches it directly.
+
 **The site is DM-only, and that is enforced in two places.** `_handle_group_message` returns
 before it ever looks for a thread link, and there is no channel path at all — no submission,
 no dedupe, no announcement. Threads are long, often half-paywalled, and the channel is for

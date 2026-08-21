@@ -132,6 +132,10 @@ chronological order, and not by the green/red bar next to each post (that one is
 the post when there is room, exactly as a note's comments do. `ACRES_COMMENTS` sets how many;
 they come off the page the post was already read from, so they cost no extra request.
 
+If a reply has a picture attached, the reply gets a 📷 link and the picture follows in its own
+album, captioned with whose reply it came from — it never joins the opening post's album,
+because an album's caption is the post and that would credit the wrong person.
+
 **This works in a DM and nowhere else.** A thread link posted in a watched group is ignored,
 and nothing is ever published to the channel. Forum posts are long, frequently half-hidden
 behind the site's points wall, and a channel of them is not what channel mode is for.

@@ -44,6 +44,10 @@ class Comment:
     # post they answer; without the name a reply reads as a non-sequitur once
     # the quote itself is stripped out.
     replying_to: str = ""
+    # Pictures attached to this comment. They are delivered separately — an
+    # album belongs to whoever wrote the post it captions — so the comment
+    # itself carries a marker linking to each one.
+    images: list[str] = field(default_factory=list)
     replies: list["Comment"] = field(default_factory=list)
 
 
@@ -124,6 +128,11 @@ def _render_one(comment: Comment, *, reply: bool, like: str = "♥") -> str:
     head = f"{bullet} <b>{who}</b>"
     if meta:
         head += f" <i>({escape(meta)})</i>"
+    for index, url in enumerate(comment.images, start=1):
+        # Markup and href targets are free against Telegram's limit, so the
+        # marker costs two units however long the URL is.
+        label = "📷" if len(comment.images) == 1 else f"📷{index}"
+        head += f' <a href="{escape(url, quote=True)}">{label}</a>'
     return f"{head}\n{escape(comment.text)}"
 
 

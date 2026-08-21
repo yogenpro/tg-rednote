@@ -17,6 +17,7 @@ from .acres import (
     find_acres_link,
     parse_credentials,
     render as render_thread,
+    reply_gallery,
     thread_id,
 )
 from .acres import looks_like_cookie as looks_like_acres_cookie
@@ -594,11 +595,13 @@ class Bot:
             self.threads.put(key, thread)
 
         items = [MediaItem("photo", url) for url in thread.images]
+        in_replies = sum(len(comment.images) for comment in thread.comments)
         log.info(
-            "thread %s: %d char(s), %d image(s), %d repl(ies)%s, requested by %s",
+            "thread %s: %d char(s), %d image(s) (+%d in replies), %d repl(ies)%s, requested by %s",
             thread.tid or "?",
             len(thread.body),
             len(items),
+            in_replies,
             len(thread.comments),
             " [cached]" if cached else "",
             user_id or chat_id or "?",
@@ -608,6 +611,7 @@ class Bot:
                 note=thread.tid,
                 kind="thread",
                 items=len(items),
+                reply_items=in_replies,
                 comments=len(thread.comments),
                 cached=cached,
                 locked=thread.locked or thread.needs_login,
@@ -668,6 +672,27 @@ class Bot:
         for piece in self._follow_up(overflow, trailing, limit=MESSAGE_LIMIT, like=ACRES_LIKE):
             sent = await self._send_and_track(chat_id, piece, reply_to=previous)
             previous = sent or previous
+
+        # Pictures that belong to replies rather than to the post, in an album
+        # of their own so the credit lands on whoever posted them.
+        gallery, gallery_caption = reply_gallery(thread.comments)
+        if gallery:
+            try:
+                async with self._busy(chat_id, "upload_photo"):
+                    await self.acres_sender.send(
+                        chat_id,
+                        [MediaItem("photo", url) for url in gallery],
+                        gallery_caption,
+                        reply_to=previous,
+                    )
+            except TelegramError as exc:
+                # The thread itself is already delivered; a failed gallery is
+                # a missing extra, not a failed submission.
+                log.warning(
+                    "reply gallery failed for thread %s: %s", thread.tid, exc.description,
+                    extra=fields(event="media_skipped", site="1p3a", note=thread.tid,
+                                 count=len(gallery)),
+                )
 
         log.info(
             "delivered thread %s in %.1fs",

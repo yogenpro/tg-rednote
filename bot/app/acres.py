@@ -492,7 +492,7 @@ def parse_replies(html: str, *, limit: int = 10, starter: str = "") -> list:
         cell = _BODY_START_RE.search(block)
         if not cell:
             continue
-        raw = _body(block, cell)[0]
+        raw, cell_end = _body(block, cell)
         quoted = ""
         quote = _QUOTE_RE.search(raw)
         if quote:
@@ -507,6 +507,9 @@ def parse_replies(html: str, *, limit: int = 10, starter: str = "") -> list:
             continue
         author = _AUTHOR_NAME_RE.search(block)
         name = plain(author.group(1)) if author else ""
+        # A reply's own attachments sit after its cell, exactly as the opening
+        # post's do — and the block is already bounded to this one post.
+        pictures = attachment_images(block[cell_end:], BBS_BASE)
         net = _score(block, pid, "rec_add") - _score(block, pid, "rec_sub")
         scored.append((
             -net,
@@ -519,10 +522,41 @@ def parse_replies(html: str, *, limit: int = 10, starter: str = "") -> list:
                 # their own thread, which is usually worth spotting.
                 location="OP" if name and name == starter else "",
                 replying_to=quoted if quoted and quoted != name else "",
+                images=pictures,
             ),
         ))
     scored.sort(key=lambda row: (row[0], row[1]))
     return [comment for _rank, _order, comment in scored[:limit]]
+
+
+# Ten is one album. A thread with more picture-carrying replies than that is
+# not worth a second one — the markers in the text still link to the rest.
+GALLERY_LIMIT = 10
+
+
+def reply_gallery(comments: list, limit: int = GALLERY_LIMIT) -> tuple[list[str], str]:
+    """(image urls, caption) for the pictures attached to replies.
+
+    They travel as their own album rather than joining the post's, because an
+    album's caption is the opening post and putting someone else's photo under
+    it credits the wrong person — the mistake this very thread nearly caused
+    when a reply's picture was almost delivered as the author's.
+    """
+    urls: list[str] = []
+    authors: list[str] = []
+    for comment in comments:
+        for url in comment.images:
+            if len(urls) >= limit:
+                break
+            urls.append(url)
+            name = comment.author or "someone"
+            if name not in authors:
+                authors.append(name)
+    if not urls:
+        return [], ""
+    if len(authors) == 1:
+        return urls, f"📷 from {escape(authors[0])}\u2019s reply"
+    return urls, "📷 from replies by " + ", ".join(escape(name) for name in authors)
 
 
 def parse_credentials(text: str) -> tuple[str, str]:

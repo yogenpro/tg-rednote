@@ -9,10 +9,12 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "bot"))
 
+from app.telegram import TelegramError  # noqa: E402
 from app.acres import (  # noqa: E402
     Acres,
     attachment_images,
     parse_replies,
+    reply_gallery,
     AcresError,
     Thread,
     canonical,
@@ -27,6 +29,7 @@ from app.acres import (  # noqa: E402
     to_text,
 )
 
+from app.comments import Comment  # noqa: E402
 from test_handlers import FakeSender, FakeTelegram, make_bot, message  # noqa: E402
 
 
@@ -220,7 +223,7 @@ def test_a_quoted_table_does_not_truncate_the_post():
 
 # ---- replies ---------------------------------------------------------
 
-def _post(pid, author, body, *, add=0, sub=0, up=999, down=1, starter=False):
+def _post(pid, author, body, *, add=0, sub=0, up=999, down=1, starter=False, image=""):
     """One post block in the shape Discuz serves.
 
     `up`/`down` are the green/red bar, which is labelled 全局 — the author's
@@ -234,6 +237,7 @@ def _post(pid, author, body, *, add=0, sub=0, up=999, down=1, starter=False):
 <span>全局：</span>
 <i id="upvote_{pid}" style="color:#16a34a">{up}</i><i id="downvote_{pid}" style="color:#ef4444">{down}</i>
 <td class="t_f" id="postmessage_{pid}">{body}</td>
+{f'<div class="pattl"><ignore_js_op><img id="aimg_{pid}" aid="{pid}" src="static/image/common/none.gif" zoomfile="{image}" file="{image}" /></ignore_js_op></div>' if image else ''}
 </table></div>"""
 
 
@@ -242,11 +246,13 @@ THREAD_PAGE = (
     + _post(1, "starter", "the opening post", add=120, sub=2, starter=True)
     # A loud author (huge global bar) with a post nobody liked.
     + _post(2, "loudmouth", "nobody agreed", add=0, sub=0, up=99999, down=8000)
-    + _post(3, "quiet", "everybody agreed", add=40, sub=1, up=3, down=0)
+    + _post(3, "quiet", "everybody agreed", add=40, sub=1, up=3, down=0,
+            image="https://oss.1p3a.com/forum/2026/mine.jpg")
     + _post(4, "starter", '<div class="quote"><blockquote><font size="2">'
             '<a href="x"><font color="#999999">loudmouth 发表于 2026-08-20 09:54:54</font></a>'
             "</font><br />nobody agreed</blockquote></div>I disagree", add=9, sub=0, starter=True)
-    + _post(5, "downvoted", "widely disliked", add=1, sub=30)
+    + _post(5, "downvoted", "widely disliked", add=1, sub=30,
+            image="https://oss.1p3a.com/forum/2026/theirs.jpg")
     + _post(6, "blank", "", add=500, sub=0)
     + "</body></html>"
 )
@@ -294,6 +300,42 @@ def test_replies_come_off_the_same_parse_as_the_post():
     thread = parse_thread(THREAD_PAGE, "https://www.1point3acres.com/home/thread/5", replies=3)
     assert thread.body == "the opening post"
     assert len(thread.comments) == 3
+
+
+def test_a_replys_picture_belongs_to_that_reply_not_to_the_post():
+    thread = parse_thread(THREAD_PAGE, "https://www.1point3acres.com/home/thread/5", replies=10)
+    assert thread.images == []  # the opening post has none of its own
+    quiet = next(c for c in thread.comments if c.author == "quiet")
+    assert quiet.images == ["https://oss.1p3a.com/forum/2026/mine.jpg"]
+
+
+def test_the_gallery_names_whose_reply_each_picture_came_from():
+    one = [Comment(author="phase", text="t", images=["https://oss/a.jpg"])]
+    urls, caption = reply_gallery(one)
+    assert urls == ["https://oss/a.jpg"] and "phase" in caption and "reply" in caption
+
+    two = one + [Comment(author="other", text="t", images=["https://oss/b.jpg"])]
+    urls, caption = reply_gallery(two)
+    assert urls == ["https://oss/a.jpg", "https://oss/b.jpg"]
+    assert "phase" in caption and "other" in caption
+
+
+def test_a_thread_with_no_reply_pictures_has_no_gallery():
+    assert reply_gallery([Comment(author="a", text="t")]) == ([], "")
+
+
+def test_the_gallery_stops_at_one_albums_worth():
+    many = [Comment(author="a", text="t", images=[f"https://oss/{i}.jpg" for i in range(20)])]
+    assert len(reply_gallery(many)[0]) == 10
+
+
+def test_a_comment_carrying_a_picture_links_to_it():
+    from app.comments import render_comments
+
+    rendered = render_comments(
+        [Comment(author="phase", text="look", images=["https://oss/a.jpg"])], limit=500
+    )
+    assert '<a href="https://oss/a.jpg">📷</a>' in rendered
 
 
 # ---- credentials -----------------------------------------------------
@@ -446,6 +488,37 @@ async def test_images_ride_in_an_album_with_the_text_as_its_caption(tmp_path):
     await bot.handle_update(message(LINK))
     (chat, items, caption, _reply, _part) = bot.acres_sender.sends[0]
     assert chat == 1 and len(items) == 2 and "T" in caption
+
+
+@pytest.mark.asyncio
+async def test_reply_pictures_travel_in_their_own_album_under_their_own_name(tmp_path):
+    thread = Thread(
+        tid="9", url="u", title="T", body="post text",
+        comments=[Comment(author="phase", text="look", images=["https://oss/a.jpg"])],
+    )
+    bot, telegram, _state = acres_bot(tmp_path, thread=thread)
+    await bot.handle_update(message(LINK))
+    (_chat, items, caption, reply_to, _part) = bot.acres_sender.sends[0]
+    assert [item.url for item in items] == ["https://oss/a.jpg"]
+    assert "phase" in caption
+    # Hung off the message it belongs under rather than sent adrift.
+    assert reply_to == 901  # the id FakeTelegram gave the post
+
+
+@pytest.mark.asyncio
+async def test_a_failed_reply_gallery_does_not_fail_the_thread(tmp_path):
+    thread = Thread(
+        tid="9", url="u", title="T", body="post text",
+        comments=[Comment(author="phase", text="look", images=["https://oss/a.jpg"])],
+    )
+    bot, telegram, _state = acres_bot(tmp_path, thread=thread)
+
+    async def boom(*a, **k):
+        raise TelegramError("sendMediaGroup", 400, "nope")
+
+    bot.acres_sender.send = boom
+    await bot.handle_update(message(LINK))
+    assert "post text" in telegram.texts  # the thread still landed
 
 
 @pytest.mark.asyncio

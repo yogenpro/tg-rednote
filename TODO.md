@@ -5,7 +5,13 @@ notes (images, Ultra-HDR albums, videos, forwarded messages, `.com` and `.cn` li
 
 ## Open
 
-- [ ] **No thread with pictures has been delivered yet.** The extraction is now written
+- [ ] **No thread whose *opening post* has pictures has been delivered yet.** A reply's
+      picture has now gone through (thread 1186207), which proves the CDN passthrough works —
+      `oss.1p3a.com` answers anonymously and Telegram fetches it. What is still unobserved is
+      the opening post's own album, which is the same code path with a different source of
+      URLs.
+
+  Was: **No thread with pictures has been delivered yet.** The extraction is now written
       against real attachment markup (`pattl` block after the cell, `zoomfile`/`file` on the
       img) and unit-tested, but no live thread has actually carried one through to Telegram,
       so the delivery half — whether Telegram fetches `oss.1p3a.com` itself or has to be
@@ -64,6 +70,10 @@ notes (images, Ultra-HDR albums, videos, forwarded messages, `.com` and `.cn` li
   attachments live in a `pattl` block *after* the post cell rather than inside it, and that
   every reply has one too: its only picture belonged to a reply, and would have been posted
   as the author's.
+
+- 1point3acres reply pictures: attached to the reply that posted them, linked with 📷 in the
+  comment, and delivered as their own album captioned with the author — never merged into the
+  opening post's album, which would credit the wrong person.
 
 - 1point3acres replies: the top 10 by the post's own 好苗/杂草 score ride in the message with
   the thread, the way a note's comments do. Ranking is done here because Discuz only serves

@@ -2,7 +2,7 @@ FROM python:3.12-slim
 
 LABEL org.opencontainers.image.title="tg-rednote" \
       org.opencontainers.image.description="Telegram bot that turns Xiaohongshu (RedNote) share links into native Telegram media" \
-      org.opencontainers.image.source="https://github.com/" \
+      org.opencontainers.image.source="https://github.com/yogenpro/tg-rednote" \
       org.opencontainers.image.licenses="MIT"
 
 ENV PYTHONUNBUFFERED=1 \

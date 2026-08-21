@@ -236,14 +236,31 @@ def _quote(parent_pid, parent_author, text="quoted words"):
     )
 
 
-def _post(pid, author, body, *, add=0, sub=0, up=999, down=1, starter=False, image=""):
+def _post(pid, author, body, *, add=0, sub=0, up=999, down=1, starter=False, image="",
+          anonymous=False):
     """One post block in the shape Discuz serves.
 
     `up`/`down` are the green/red bar, which is labelled 全局 — the author's
     lifetime reputation. `add`/`sub` are 好苗/杂草 on this post.
+
+    An anonymous poster gets no itemprop="author" block and no profile link;
+    the handle sits as bare text in the byline cell, which is the only place
+    it appears.
     """
+    byline = (
+        f'<p class="authi"><img class="authicn vm" id="authicon{pid}" '
+        f'src="static/image/common/online_member.gif" /> {author}&nbsp;'
+        f'<em id="authorposton{pid}">4 小时前</em></p>'
+        if anonymous
+        else f'<div itemprop="author" itemscope>'
+        f'<a itemprop="url" href="home.php?mod=space&amp;uid={pid}0"></a>'
+        f'<span itemprop="name">{author}</span></div>'
+        f'<p class="authi"><img class="authicn vm" id="authicon{pid}" src="x.gif" /> '
+        f'<a href="space-uid-{pid}0.html" class="xi2">{author}</a>'
+        f'<em id="authorposton{pid}">4 小时前</em></p>'
+    )
     return f"""<div id="post_{pid}"><table class="plhin">
-<div itemprop="author" itemscope><span itemprop="name">{author}</span></div>
+{byline}
 {'<img class="authicn vm" src="static/image/common/ico_lz.png" />' if starter else ''}
 <i id="rec_add_{pid}" style="display:none">{add}</i>
 <i id="rec_sub_{pid}" style="display:none">{sub}</i>
@@ -276,6 +293,35 @@ def test_replies_rank_by_the_posts_own_score_not_the_authors_reputation():
     assert [c.author for c in replies] == ["quiet", "starter", "loudmouth", "downvoted"]
     # loudmouth has the biggest 全局 bar on the page and still ranks third.
     assert replies[0].likes == "39"
+
+
+ANONYMOUS_PAGE = (
+    '<html><head><base href="https://www.1point3acres.com/bbs/" /></head><body>'
+    + '<span id="thread_subject">asking without my name on it</span>'
+    + _post(1, "匿名用户-3G7AI", "the opening post", add=5, anonymous=True)
+    + _post(2, "DoraEstel", "a named reply", add=53)
+    + _post(3, "匿名用户-JZ4OW", "one anonymous reply", add=9, anonymous=True)
+    + _post(4, "匿名用户-JDSMH", "a different anonymous reply", add=30, anonymous=True)
+    + "</body></html>"
+)
+
+
+def test_anonymous_posters_keep_the_handle_the_forum_gave_them():
+    # Two anonymous posters in one thread are two people; collapsing both to
+    # "anon" reads as one person answering themselves.
+    replies = parse_replies(ANONYMOUS_PAGE, limit=10)
+    assert [c.author for c in replies] == [
+        "DoraEstel", "匿名用户-JDSMH", "匿名用户-JZ4OW",
+    ]
+
+
+def test_an_anonymous_starter_does_not_borrow_a_repliers_byline():
+    # An anonymous opening post carries no itemprop="author" and no profile
+    # link, so an unbounded search finds the first *named* reply and credits
+    # the thread to them — seen live on thread 1186472.
+    thread = parse_thread(ANONYMOUS_PAGE, "https://www.1point3acres.com/home/thread/9")
+    assert thread.author == "匿名用户-3G7AI"
+    assert thread.author_url == ""
 
 
 def test_the_opening_post_is_never_one_of_the_replies():

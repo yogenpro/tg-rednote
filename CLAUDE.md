@@ -187,6 +187,18 @@ losing game, and the paywall block nests divs, which no regex can unwind. *Pages
 Points-walled text leaves a visible `[…]` rather than being sewn shut, because splicing the
 two halves together reads as the author's own sentence.
 
+**An anonymous poster has no byline markup at all.** 1point3acres lets people post as
+`匿名用户-XXXXX`, and Discuz then omits both `itemprop="author"` and the `space-uid` profile
+link — the handle exists only as bare text in the byline cell (`id="authicon<pid>"`). Two
+consequences, both seen live on thread 1186472. Falling back to `"anon"` merges every
+anonymous poster in a thread into one apparent person; and because the opening post's author
+used to be searched for across the *whole page*, an anonymous thread starter was credited with
+the first **named reply's** name *and their profile link* — a real person publicly bylined on
+a post they did not write. `_author_of(block, pid)` reads the byline cell when the structured
+markup is missing, and `parse_thread` bounds its search to the opening post. The already
+published telegra.ph page was corrected in place via `editPage`, which keeps the URL the
+channel post points at.
+
 **A post's pictures are not in the post.** Discuz renders attachments in a `pattl` block
 *after* the `t_f` cell, not inside it, unless the author placed them inline with
 `[attachimg]` — so the body extractor never sees them, and only `<img>` carrying

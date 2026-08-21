@@ -344,7 +344,23 @@ _AUTHOR_RE = re.compile(
     r'<div[^>]*itemprop="author".*?<span[^>]*itemprop="name"[^>]*>(.*?)</span>', re.S | re.I
 )
 _UID_RE = re.compile(r'home\.php\?mod=space&(?:amp;)?uid=(\d+)', re.I)
+# Anonymous posters have neither a profile link nor an itemprop="author"
+# block: Discuz writes the handle (匿名用户-XXXXX) as bare text in the byline
+# cell. Without this fallback two different anonymous posters in one thread
+# both come out as "anon", which reads as one person answering themselves.
+_AUTHI_RE = re.compile(r'id="authicon(\d+)"[^>]*>(.*?)(?:<em\b|<span\b|</div>)', re.S | re.I)
 _DATE_RE = re.compile(r'<meta[^>]*itemprop="datePublished"[^>]*content="([^"]*)"', re.I)
+
+
+def _author_of(block: str, pid: str = "") -> str:
+    """The poster's name, whether or not they posted under an account."""
+    named = _AUTHOR_RE.search(block)
+    if named:
+        return plain(named.group(1))
+    for found in _AUTHI_RE.finditer(block):
+        if not pid or found.group(1) == pid:
+            return plain(found.group(2))
+    return ""
 _TAG_RE = re.compile(r'<a[^>]*class="taglink[^"]*"[^>]*>(.*?)</a>', re.S | re.I)
 # The structured line interview-experience posts carry above the body: term,
 # role, degree, outcome. It sits in its own span immediately before the post.
@@ -435,10 +451,12 @@ def parse_thread(html: str, url: str, *, replies: int = 10) -> Thread | None:
         locked=locked,
         needs_login=needs_login,
     )
-    author = _AUTHOR_RE.search(html)
-    if author:
-        thread.author = plain(author.group(1))
-    uid = _UID_RE.search(html)
+    # Bounded to the opening post: an anonymous starter has no byline markup
+    # of their own, and an unbounded search would hand them the first *named*
+    # reply's name and profile link.
+    head = html[: _post_extent(html, match.group(1), cell_end)]
+    thread.author = _author_of(head, match.group(1))
+    uid = _UID_RE.search(head)
     if uid:
         thread.author_url = f"https://{HOST}/bbs/space-uid-{uid.group(1)}.html"
     published = _DATE_RE.search(html)
@@ -472,9 +490,6 @@ _QUOTE_AUTHOR_RE = re.compile(r'<font color="#999999">\s*(.*?)\s+\u53d1\u8868\u4
 # The quote links back to the exact post it answers, which is what makes a
 # conversation reconstructable rather than guessable from names.
 _QUOTE_PID_RE = re.compile(r"goto=findpost&(?:amp;)?pid=(\d+)", re.I)
-_AUTHOR_NAME_RE = re.compile(
-    r'<div[^>]*itemprop="author".*?<span[^>]*itemprop="name"[^>]*>(.*?)</span>', re.S | re.I
-)
 _THREAD_STARTER_RE = re.compile(r'ico_lz\.png|\u697c\u4e3b', re.I)
 
 
@@ -531,8 +546,7 @@ def parse_replies(html: str, *, limit: int = 10, starter: str = "") -> list:
         text = to_text(raw)[0]
         if not text:
             continue
-        author = _AUTHOR_NAME_RE.search(block)
-        name = plain(author.group(1)) if author else ""
+        name = _author_of(block, pid)
         net = _score(block, pid, "rec_add") - _score(block, pid, "rec_sub")
         records[pid] = {
             "order": order,

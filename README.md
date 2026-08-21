@@ -141,9 +141,12 @@ incidental, and chunking that into four Telegram messages reads far worse than o
 `ACRES_TELEGRAPH=false` for the chunked-message form — which is also the automatic fallback if
 telegra.ph is unreachable, so an outage costs the format and not the thread.
 
-Replies are ranked by the post's own 好苗/杂草 score, not by the page's chronological order,
+Replies that answer another reply are nested under it, the way the forum shows them and the
+way a note's comments carry their own replies — the quote block links back to the exact post
+it answers, so the conversation reconstructs rather than being guessed at. Replies are ranked
+by the post's own 好苗/杂草 score, not by the page's chronological order,
 and not by the green/red bar next to each post — that one is labelled 全局 and measures the
-*author's* lifetime reputation, not the reply. `ACRES_COMMENTS` sets how many; they come off
+*author's* lifetime reputation, not the reply. `ACRES_COMMENTS` sets how many conversations; they come off
 the page the post was already read from, so they cost no extra request. A reply's own pictures
 stay with that reply.
 

@@ -124,7 +124,12 @@ class AcresError(RuntimeError):
 @dataclass
 class Thread:
     tid: str
-    url: str
+    url: str  # the /bbs/ permalink, which is the only shape that serves HTML
+    # The shape the reader actually shared. Every share form addresses the same
+    # tid and the fetch has to use the Discuz permalink, but handing back a URL
+    # the reader did not send — in an older UI than the one they were looking
+    # at — is a small, avoidable surprise.
+    share_url: str = ""
     title: str = ""
     author: str = ""
     author_url: str = ""
@@ -144,6 +149,11 @@ class Thread:
     # thread, so re-sending a link inside the cache TTL hands back the page
     # that exists instead of minting another one.
     page: str = ""
+
+    @property
+    def link(self) -> str:
+        """Where to point a reader. What they shared, if we know it."""
+        return self.share_url or self.url
 
 
 def find_acres_link(text: str) -> str | None:
@@ -459,6 +469,9 @@ def parse_thread(html: str, url: str, *, replies: int = 10) -> Thread | None:
 # `rec_sub_<pid>`, which do vary post by post.
 _QUOTE_RE = re.compile(r'<div class="quote">.*?</blockquote>\s*</div>', re.S | re.I)
 _QUOTE_AUTHOR_RE = re.compile(r'<font color="#999999">\s*(.*?)\s+\u53d1\u8868\u4e8e', re.S | re.I)
+# The quote links back to the exact post it answers, which is what makes a
+# conversation reconstructable rather than guessable from names.
+_QUOTE_PID_RE = re.compile(r"goto=findpost&(?:amp;)?pid=(\d+)", re.I)
 _AUTHOR_NAME_RE = re.compile(
     r'<div[^>]*itemprop="author".*?<span[^>]*itemprop="name"[^>]*>(.*?)</span>', re.S | re.I
 )
@@ -480,7 +493,13 @@ def _posts(html: str) -> list[tuple[str, str]]:
 
 
 def parse_replies(html: str, *, limit: int = 10, starter: str = "") -> list:
-    """The best replies on page one, ranked by net 好苗 and cut to `limit`.
+    """The best conversations on page one, ranked by net 好苗 and cut to `limit`.
+
+    Replies nest. A quote carries `goto=findpost&pid=<parent>`, an exact
+    pointer to the post it answers, so a chain reconstructs precisely rather
+    than by matching names — and the forum's own UI shows these inline under
+    what they answer. `limit` counts top-level replies; a conversation hanging
+    off one travels with it, the way a note's comment brings its subComments.
 
     Best-effort like everything else here: a shape this does not recognise
     yields fewer replies, never a failed thread.
@@ -489,7 +508,8 @@ def parse_replies(html: str, *, limit: int = 10, starter: str = "") -> list:
 
     if limit <= 0:
         return []
-    scored: list[tuple[int, int, Comment]] = []
+
+    records: dict[str, dict] = {}
     for order, (pid, block) in enumerate(_posts(html)):
         if order == 0:
             continue  # the opening post is the thread, not a reply
@@ -497,40 +517,69 @@ def parse_replies(html: str, *, limit: int = 10, starter: str = "") -> list:
         if not cell:
             continue
         raw, cell_end = _body(block, cell)
+        parent = ""
         quoted = ""
         quote = _QUOTE_RE.search(raw)
         if quote:
-            # The quote repeats a post the reader may already have seen, so it
-            # comes out — but the name stays, or the answer reads as a
-            # non-sequitur.
+            # The quote repeats a post already on screen, so it comes out; the
+            # pid it points at is what lets the reply be filed under it.
             found = _QUOTE_AUTHOR_RE.search(quote.group(0))
             quoted = plain(found.group(1)) if found else ""
+            pointer = _QUOTE_PID_RE.search(quote.group(0))
+            parent = pointer.group(1) if pointer else ""
             raw = raw.replace(quote.group(0), "")
         text = to_text(raw)[0]
         if not text:
             continue
         author = _AUTHOR_NAME_RE.search(block)
         name = plain(author.group(1)) if author else ""
-        # A reply's own attachments sit after its cell, exactly as the opening
-        # post's do — and the block is already bounded to this one post.
-        pictures = attachment_images(block[cell_end:], BBS_BASE)
         net = _score(block, pid, "rec_add") - _score(block, pid, "rec_sub")
-        scored.append((
-            -net,
-            order,
-            Comment(
+        records[pid] = {
+            "order": order,
+            "parent": parent,
+            "score": net,
+            "comment": Comment(
                 author=name,
                 text=text,
                 likes="" if net <= 0 else str(net),
                 # Not a place: the chip marks the thread starter answering in
                 # their own thread, which is usually worth spotting.
                 location="OP" if name and name == starter else "",
-                replying_to=quoted if quoted and quoted != name else "",
-                images=pictures,
+                # Answering the thread starter is the default and says
+                # nothing; answering someone else is the interesting case.
+                replying_to=quoted if quoted and quoted not in (name, starter) else "",
+                images=attachment_images(block[cell_end:], BBS_BASE),
             ),
-        ))
-    scored.sort(key=lambda row: (row[0], row[1]))
-    return [comment for _rank, _order, comment in scored[:limit]]
+        }
+
+    children: dict[str, list[str]] = {}
+    roots: list[str] = []
+    for pid, record in records.items():
+        parent = record["parent"]
+        if parent in records:
+            children.setdefault(parent, []).append(pid)
+        else:
+            roots.append(pid)
+
+    def descendants(pid: str) -> list[str]:
+        """Everything hanging off `pid`, depth-first, in the order posted."""
+        found: list[str] = []
+        for child in sorted(children.get(pid, []), key=lambda p: records[p]["order"]):
+            found.append(child)
+            found.extend(descendants(child))
+        return found
+
+    roots.sort(key=lambda pid: (-records[pid]["score"], records[pid]["order"]))
+    conversations = []
+    for pid in roots[:limit]:
+        top = records[pid]["comment"]
+        for child in descendants(pid):
+            reply = records[child]["comment"]
+            if records[child]["parent"] == pid:
+                reply.replying_to = ""  # it sits directly under what it answers
+            top.replies.append(reply)
+        conversations.append(top)
+    return conversations
 
 
 # Ten is one album. A thread with more picture-carrying replies than that is
@@ -643,6 +692,9 @@ class Acres:
             raise AcresError("network", f"1point3acres returned HTTP {response.status_code}")
 
         thread = parse_thread(html, target, replies=self._replies)
+        if thread is not None:
+            # Tracking parameters are not part of the thread.
+            thread.share_url = url.split("?")[0]
         if thread is None:
             if any(marker in html for marker in _NOTICE_MARKERS):
                 raise AcresError("login", "the forum served a notice page instead of the thread")
@@ -674,7 +726,7 @@ def render(thread: Thread, *, limit: int, reserve: int = 0) -> tuple[str, str]:
     foot_plain = " · ".join(bits + [link_text])
     foot_html = " · ".join(
         [escape(b) for b in bits]
-        + [f'<a href="{escape(thread.url, quote=True)}">{link_text}</a>']
+        + [f'<a href="{escape(thread.link, quote=True)}">{link_text}</a>']
     )
 
     head_html = ""
@@ -753,6 +805,21 @@ def _figure(url: str, caption: str = "") -> dict:
     return {"tag": "figure", "children": children}
 
 
+def _comment_nodes(comment) -> list:
+    head: list = [{"tag": "strong", "children": [comment.author or "anon"]}]
+    if comment.replying_to:
+        head.append(f" → {comment.replying_to}")
+    chips = " · ".join(
+        bit for bit in (comment.likes and f"👍 {comment.likes}", comment.location) if bit
+    )
+    if chips:
+        head.append({"tag": "em", "children": [f" ({chips})"]})
+    nodes: list = [{"tag": "p", "children": head}]
+    nodes.extend(_paragraphs(comment.text))
+    nodes.extend(_figure(url) for url in comment.images)
+    return nodes
+
+
 def to_nodes(thread: Thread) -> list:
     """A whole thread as Telegraph content: post, pictures, then replies.
 
@@ -774,17 +841,14 @@ def to_nodes(thread: Thread) -> list:
         nodes.append({"tag": "hr"})
         nodes.append({"tag": "h3", "children": ["Top replies"]})
         for comment in thread.comments:
-            head: list = [{"tag": "strong", "children": [comment.author or "anon"]}]
-            if comment.replying_to:
-                head.append(f" → {comment.replying_to}")
-            chips = " · ".join(
-                bit for bit in (comment.likes and f"👍 {comment.likes}", comment.location) if bit
-            )
-            if chips:
-                head.append({"tag": "em", "children": [f" ({chips})"]})
-            nodes.append({"tag": "p", "children": head})
-            nodes.extend(_paragraphs(comment.text))
-            nodes.extend(_figure(url) for url in comment.images)
+            nodes.extend(_comment_nodes(comment))
+            if comment.replies:
+                # The answers to a reply, indented under it — the shape the
+                # forum shows them in, and the shape a note's comments keep.
+                nested: list = []
+                for reply in comment.replies:
+                    nested.extend(_comment_nodes(reply))
+                nodes.append({"tag": "blockquote", "children": nested})
 
     return nodes
 
@@ -798,7 +862,7 @@ def source_nodes(thread: Thread) -> list:
         {
             "tag": "p",
             "children": [
-                {"tag": "a", "attrs": {"href": thread.url}, "children": ["Read it on 1point3acres"]}
+                {"tag": "a", "attrs": {"href": thread.link}, "children": ["Read it on 1point3acres"]}
             ],
         },
     ]

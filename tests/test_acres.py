@@ -26,6 +26,8 @@ from app.acres import (  # noqa: E402
     parse_thread,
     render,
     scrub,
+    source_nodes,
+    to_nodes,
     thread_id,
     to_text,
 )
@@ -224,6 +226,16 @@ def test_a_quoted_table_does_not_truncate_the_post():
 
 # ---- replies ---------------------------------------------------------
 
+def _quote(parent_pid, parent_author, text="quoted words"):
+    """A Discuz quote block: it links back to the exact post it answers."""
+    return (
+        '<div class="quote"><blockquote><font size="2">'
+        f'<a href="forum.php?mod=redirect&amp;goto=findpost&amp;pid={parent_pid}&amp;ptid=1">'
+        f'<font color="#999999">{parent_author} 发表于 2026-08-20 09:54:54</font></a>'
+        f"</font><br />{text}</blockquote></div>"
+    )
+
+
 def _post(pid, author, body, *, add=0, sub=0, up=999, down=1, starter=False, image=""):
     """One post block in the shape Discuz serves.
 
@@ -337,6 +349,82 @@ def test_a_comment_carrying_a_picture_links_to_it():
         [Comment(author="phase", text="look", images=["https://oss/a.jpg"])], limit=500
     )
     assert '<a href="https://oss/a.jpg">📷</a>' in rendered
+
+
+# A conversation: 20 is answered by 21, which is answered in turn by 22.
+NESTED_PAGE = (
+    '<html><head><base href="https://www.1point3acres.com/bbs/" /></head><body>'
+    + _post(1, "starter", "the opening post", add=99, starter=True)
+    + _post(10, "popular", "everyone agreed", add=50)
+    + _post(20, "asker", "how long does it take?", add=5)
+    + _post(21, "answerer", _quote(20, "asker") + "about six weeks", add=3)
+    + _post(22, "starter", _quote(21, "answerer") + "thank you", add=1, starter=True)
+    + _post(30, "quoting_op", _quote(1, "starter") + "replying to the thread itself", add=2)
+    + "</body></html>"
+)
+
+
+def test_a_conversation_nests_under_the_reply_it_answers():
+    replies = parse_replies(NESTED_PAGE, limit=10, starter="starter")
+    top = [c.author for c in replies]
+    assert top == ["popular", "asker", "quoting_op"]  # 21 and 22 are not top-level
+    conversation = next(c for c in replies if c.author == "asker")
+    assert [r.author for r in conversation.replies] == ["answerer", "starter"]
+
+
+def test_a_nested_reply_drops_the_arrow_to_what_it_already_sits_under():
+    conversation = next(
+        c for c in parse_replies(NESTED_PAGE, starter="starter") if c.author == "asker"
+    )
+    direct, deeper = conversation.replies
+    assert direct.replying_to == ""          # it is directly under "asker"
+    assert deeper.replying_to == "answerer"  # it answers a sibling, so say so
+
+
+def test_answering_the_thread_starter_is_not_worth_an_arrow():
+    # Most replies answer the opening post; saying so on every one is noise.
+    quoting_op = next(
+        c for c in parse_replies(NESTED_PAGE, starter="starter") if c.author == "quoting_op"
+    )
+    assert quoting_op.replying_to == ""
+
+
+def test_the_limit_counts_conversations_not_posts():
+    replies = parse_replies(NESTED_PAGE, limit=2, starter="starter")
+    assert [c.author for c in replies] == ["popular", "asker"]
+    # The conversation travels with the reply it belongs to.
+    assert len(replies[1].replies) == 2
+
+
+def test_the_link_handed_back_is_the_one_that_was_shared():
+    """Every share shape addresses one tid and the fetch needs the Discuz
+    permalink, but answering with a URL the reader never sent — in an older UI
+    than the one they were on — is a needless surprise."""
+    thread = Thread(tid="9", url="https://www.1point3acres.com/bbs/thread-9-1-1.html")
+    assert thread.link.endswith("/bbs/thread-9-1-1.html")
+
+    thread.share_url = "https://www.1point3acres.com/home/thread/9"
+    assert thread.link == "https://www.1point3acres.com/home/thread/9"
+    head, _overflow = render(thread, limit=1024)
+    assert "/home/thread/9" in head and "/bbs/thread-9-1-1.html" not in head
+
+
+def test_the_page_points_home_to_the_shared_link_too():
+    thread = Thread(
+        tid="9", url="https://www.1point3acres.com/bbs/thread-9-1-1.html",
+        share_url="https://www.1point3acres.com/home/thread/9", body="b",
+    )
+    blob = str(to_nodes(thread) + source_nodes(thread))
+    assert "/home/thread/9" in blob and "/bbs/thread-9-1-1.html" not in blob
+
+
+def test_a_conversation_reaches_the_telegraph_page_nested():
+    thread = Thread(tid="9", url="u", body="b")
+    thread.comments = parse_replies(NESTED_PAGE, starter="starter")
+    nodes = to_nodes(thread)
+    quoted = [n for n in nodes if isinstance(n, dict) and n.get("tag") == "blockquote"]
+    assert quoted, "nested replies should be indented under what they answer"
+    assert "answerer" in str(quoted)
 
 
 # ---- credentials -----------------------------------------------------

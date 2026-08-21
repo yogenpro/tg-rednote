@@ -82,7 +82,7 @@ def _page_message(thread: Thread, page: str) -> str:
     lines = [f'📄 <a href="{escape(page, quote=True)}">{escape(thread.title or "Untitled")}</a>']
     if meta:
         lines.append(meta)
-    lines.append(f'<a href="{escape(thread.url, quote=True)}">open on 1point3acres</a>')
+    lines.append(f'<a href="{escape(thread.link, quote=True)}">open on 1point3acres</a>')
     return "\n".join(lines)
 
 CONTINUED = "continues ↓"

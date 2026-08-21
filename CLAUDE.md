@@ -198,6 +198,21 @@ is Discuz's standing "log in to view attachments" banner and appears on every po
 regardless — it is *not* a gate, and reading it as one warned about a points wall on threads
 that were entirely visible.
 
+**Forum replies nest, and the quote says exactly where.** A quote block links back with
+`goto=findpost&pid=<parent>` — an exact pointer, so a conversation reconstructs precisely
+instead of being guessed at from names. `parse_replies` builds the tree, ranks the *top-level*
+replies, and flattens each conversation underneath the one it hangs off, which is the same
+one-level shape a note's `subComments` take and what `render_comments` already draws with `↳`.
+Telegraph indents them in a `blockquote`. Two arrows are suppressed as noise rather than
+information: a reply sitting directly under what it answers, and a reply to the thread starter
+(which is what most replies are). `limit` counts conversations, not posts.
+
+**The link handed back is the one that was shared.** Every share shape addresses the same tid
+and the fetch has to use the `/bbs/` permalink — it is the only one that serves HTML — but
+answering a `/home/thread/<id>` link with a `/bbs/thread-<id>-1-1.html` one hands the reader a
+different, older UI than the one they were looking at. `Thread.share_url` keeps what arrived
+and `Thread.link` is what the reader ever sees.
+
 **Ranking forum replies: the obvious signal is the wrong one.** Every post shows a green/red
 bar, but it is labelled 全局 — the *author's* lifetime reputation, not the post's score; the
 same user shows identical numbers on every post they make in a thread, which is how it was

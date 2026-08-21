@@ -11,6 +11,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "bot"))
 
 from app.acres import (  # noqa: E402
     Acres,
+    attachment_images,
     AcresError,
     Thread,
     canonical,
@@ -163,6 +164,44 @@ def test_attachments_are_taken_over_thumbnails_and_chrome_is_dropped():
         "https://www.1point3acres.com/bbs/data/attachment/forum/shot.png",
         "https://oss.1p3a.com/asset/2026/pic.png",
     ]
+
+
+# Discuz puts a post's own uploads in a `pattl` block *after* the cell, and
+# every post on the page — replies included — has one in the same shape.
+ATTACHED = """<html><head><meta charset="gbk"><base href="https://www.1point3acres.com/bbs/" /></head>
+<body>
+<div id="post_100"><table class="plhin">
+<td class="t_f" id="postmessage_100">the opening post</td>
+<div class="pattl"><ignore_js_op><dl><dd>
+<a href="javascript:;" onclick="imageRotate('aimg_1', 1)"><img src="static/image/common/rleft.gif" /></a>
+<img id="aimg_1" aid="1" src="static/image/common/none.gif"
+ zoomfile="https://oss.1p3a.com/forum/202608/14/mine.jpg"
+ file="https://oss.1p3a.com/forum/202608/14/mine.jpg" />
+</dd></dl></ignore_js_op></div>
+</table></div>
+<div id="post_200"><table class="plhin">
+<td class="t_f" id="postmessage_200">a reply</td>
+<div class="pattl"><ignore_js_op><img id="aimg_2" aid="2" src="static/image/common/none.gif"
+ zoomfile="https://oss.1p3a.com/forum/202608/14/theirs.jpg" /></ignore_js_op></div>
+</table></div></body></html>"""
+
+
+def test_an_attachment_rendered_after_the_cell_is_still_the_posts_own():
+    thread = parse_thread(ATTACHED, "https://www.1point3acres.com/home/thread/5")
+    assert thread.body == "the opening post"
+    assert thread.images == ["https://oss.1p3a.com/forum/202608/14/mine.jpg"]
+
+
+def test_a_replys_attachment_is_never_posted_as_the_authors():
+    thread = parse_thread(ATTACHED, "https://www.1point3acres.com/home/thread/5")
+    assert not any("theirs" in url for url in thread.images)
+
+
+def test_only_images_carrying_an_attachment_attribute_are_collected():
+    # The same region holds rotate buttons and the forum's house ads; neither
+    # has zoomfile or file.
+    assert attachment_images('<img src="https://oss.1p3a.com/asset/2026/vip-banner.png" />') == []
+    assert attachment_images('<img src="static/image/common/rleft.gif" />') == []
 
 
 def test_a_page_that_is_not_a_thread_parses_to_nothing():

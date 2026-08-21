@@ -145,6 +145,17 @@ losing game, and the paywall block nests divs, which no regex can unwind. *Pages
 Points-walled text leaves a visible `[…]` rather than being sewn shut, because splicing the
 two halves together reads as the author's own sentence.
 
+**A post's pictures are not in the post.** Discuz renders attachments in a `pattl` block
+*after* the `t_f` cell, not inside it, unless the author placed them inline with
+`[attachimg]` — so the body extractor never sees them, and only `<img>` carrying
+`zoomfile`/`file` is one (the same region holds rating chrome and house ads). Every post on
+the page has such a block, replies included, so the search is bounded by the next
+`<div id="post_">`; verified live on a thread whose only picture belonged to a reply, which
+would otherwise have been posted as the author's. Related: `attach_nopermission attach_tips`
+is Discuz's standing "log in to view attachments" banner and appears on every post cell
+regardless — it is *not* a gate, and reading it as one warned about a points wall on threads
+that were entirely visible.
+
 **The site is DM-only, and that is enforced in two places.** `_handle_group_message` returns
 before it ever looks for a thread link, and there is no channel path at all — no submission,
 no dedupe, no announcement. Threads are long, often half-paywalled, and the channel is for

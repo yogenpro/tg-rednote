@@ -5,11 +5,12 @@ notes (images, Ultra-HDR albums, videos, forwarded messages, `.com` and `.cn` li
 
 ## Open
 
-- [ ] **Attachments are still unproven.** The first live thread had none, so the image path —
-      `zoomfile`/`file` URLs off a Discuz attachment, and whether Telegram will fetch
-      `oss.1p3a.com` directly or has to be handed the bytes — has never run. `auto` mode
-      falls back on a 400, so it should self-heal, but it is written from the templates
-      rather than from observation. Send a thread with pictures in it.
+- [ ] **No thread with pictures has been delivered yet.** The extraction is now written
+      against real attachment markup (`pattl` block after the cell, `zoomfile`/`file` on the
+      img) and unit-tested, but no live thread has actually carried one through to Telegram,
+      so the delivery half — whether Telegram fetches `oss.1p3a.com` itself or has to be
+      handed the bytes — is still unobserved. `auto` mode falls back on a 400, so it should
+      self-heal either way.
 
 - [ ] **Only the opening post is delivered.** Replies are often where the value is on that
       forum, and the page already carries them (`postmessage_<pid>` repeats per post). Worth
@@ -64,7 +65,10 @@ notes (images, Ultra-HDR albums, videos, forwarded messages, `.com` and `.cn` li
   forum and date, no jammer leakage. The first fetch also turned up a false positive:
   Discuz prints its "log in to view attachments" banner at the top of every post cell
   regardless, so a fully readable thread was being labelled as behind the points wall.
-  Fixed — only a bare `attach_nopermission` counts.
+  Fixed — only a bare `attach_nopermission` counts. A second thread then showed that
+  attachments live in a `pattl` block *after* the post cell rather than inside it, and that
+  every reply has one too: its only picture belonged to a reply, and would have been posted
+  as the author's.
 
 - 1point3acres: thread links in a DM come back as the opening post, with the site's
   `<font class="jammer">` interference and zero-width characters stripped, GBK decoded,

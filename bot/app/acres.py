@@ -339,19 +339,59 @@ _BASE_RE = re.compile(r'<base[^>]*href="([^"]*)"', re.I)
 _NOTICE_MARKERS = ("提示信息", "您需要登录才可以", "本主题需要", "无权访问", "只有本人可见")
 
 
-def _body(html: str, start: re.Match) -> str:
-    """The post cell, matched by counting <td> rather than to the first </td>.
+def _body(html: str, start: re.Match) -> tuple[str, int]:
+    """(the post cell, where it ends), counting <td> rather than stopping at
+    the first </td>.
 
     A quoted table inside a post would end a non-greedy match early and lose
-    the rest of the text.
+    the rest of the text. The end offset matters too: a post's attachments are
+    rendered *after* the cell, and finding them means knowing where to look.
     """
     depth = 1
     cursor = start.end()
     for token in _TD_RE.finditer(html, cursor):
         depth += -1 if token.group(0).startswith("</") else 1
         if depth == 0:
-            return html[cursor : token.start()]
-    return html[cursor:]
+            return html[cursor : token.start()], token.start()
+    return html[cursor:], len(html)
+
+
+_POST_RE = re.compile(r'<div id="post_(\d+)"', re.I)
+_IMG_TAG_RE = re.compile(r"<img\b[^>]*>", re.I)
+_ATTR_RE = re.compile(r'([\w-]+)\s*=\s*"([^"]*)"')
+
+
+def attachment_images(fragment: str, base: str = BBS_BASE) -> list[str]:
+    """Attachment images, which Discuz renders outside the post cell.
+
+    A post's own uploads land in a `pattl` block *after* `t_f`, not inside it,
+    unless the author placed them inline with [attachimg] — so the body
+    extractor never sees them. Only `<img>` carrying `zoomfile`/`file` counts:
+    the same region holds rating chrome and the forum's house ads, and those
+    have neither.
+    """
+    found: list[str] = []
+    for tag in _IMG_TAG_RE.finditer(fragment):
+        attrs = {key.lower(): value for key, value in _ATTR_RE.findall(tag.group(0))}
+        src = (attrs.get("zoomfile") or attrs.get("file") or "").strip()
+        if not src or src.startswith("data:") or _CHROME_IMAGE_RE.search(src):
+            continue
+        url = urljoin(base, src)
+        if url not in found:
+            found.append(url)
+    return found
+
+
+def _post_extent(html: str, pid: str, after: int) -> int:
+    """Where the post that owns `pid` stops.
+
+    Replies carry attachments too, and they are markup-identical to the
+    opening post's — verified live on a thread whose only picture belonged to
+    a reply. Without this bound the first reply's photos would be posted as
+    the author's.
+    """
+    following = _POST_RE.search(html, after)
+    return following.start() if following else len(html)
 
 
 def parse_thread(html: str, url: str) -> Thread | None:
@@ -362,7 +402,13 @@ def parse_thread(html: str, url: str) -> Thread | None:
     base_match = _BASE_RE.search(html)
     base = base_match.group(1) if base_match else BBS_BASE
 
-    text, images, locked, needs_login = to_text(_body(html, match), base)
+    cell, cell_end = _body(html, match)
+    text, images, locked, needs_login = to_text(cell, base)
+    # Anything the author attached rather than inlined sits between the end of
+    # the cell and the start of the next post.
+    for url in attachment_images(html[cell_end : _post_extent(html, match.group(1), cell_end)], base):
+        if url not in images:
+            images.append(url)
     thread = Thread(
         tid=thread_id(url) or "",
         url=url,

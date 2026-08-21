@@ -1,6 +1,6 @@
 # TODO
 
-Status as of 2026-08-20. Tests: 142 passing. The bot has been exercised live against ~15 real
+Status as of 2026-08-21. Tests: 142 passing. The bot has been exercised live against ~15 real
 notes (images, Ultra-HDR albums, videos, forwarded messages, `.com` and `.cn` links).
 
 ## Open
@@ -50,6 +50,11 @@ notes (images, Ultra-HDR albums, videos, forwarded messages, `.com` and `.cn` li
       spawns a task. Fine for single-digit users, a problem if the allowlist ever grows.
 
 ## Recently done (context for the above)
+
+- CI: `tests` runs the suite on 3.12 and 3.13 for every push and PR; `publish` builds
+  `./bot` for amd64 and arm64 and pushes to `ghcr.io/yogenpro/tg-rednote` (`latest` on
+  main, `sha-<commit>` always, `vX.Y.Z` on a release tag). Both green, image public,
+  multi-arch manifest verified.
 
 - Observability: `LOG_FORMAT=json`, an `event` vocabulary, per-submission `rid`, and
   `OBSERVABILITY.md` with the Alloy pipeline (including log-derived Prometheus metrics) and

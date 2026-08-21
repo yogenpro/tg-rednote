@@ -130,6 +130,14 @@ together. Alloy turns the lines into Prometheus metrics, so the bot never has to
 port. Event vocabulary and queries: `OBSERVABILITY.md`. When adding a log line that someone
 might later want to count, give it an `event`.
 
+**CI lives in `.github/workflows/`.** `tests.yml` runs the suite on 3.12 and 3.13 for every
+push and pull request — it needs no network, sidecar or Telegram, so a red run is a real
+failure, never flake. `publish.yml` builds `bot/` for amd64 and arm64 (QEMU) and pushes to
+`ghcr.io/yogenpro/tg-rednote` on every push to `main`: `latest` tracks main, `sha-<commit>`
+pins a build, `vX.Y.Z` appears on a release tag. The package is public, so `docker pull` needs
+no login. Actions are pinned to majors that run on Node 24; older ones only produce
+deprecation annotations, not failures.
+
 ## Running it locally (no Docker)
 
 The image builds and smoke-tests clean, but day-to-day work here uses a venv (system Python is

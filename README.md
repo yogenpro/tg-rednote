@@ -126,6 +126,12 @@ A link to a [1point3acres](https://www.1point3acres.com) thread — any of `/hom
 `/interview/thread/<id>` or the old `/bbs/thread-<id>-1-1.html` — comes back as the opening
 post: title, author, the text, and any images the post carries.
 
+The top replies come with it — ranked by the post's own 好苗/杂草 score, not by the page's
+chronological order, and not by the green/red bar next to each post (that one is labelled
+全局 and measures the *author's* reputation, not the reply). They ride in the same message as
+the post when there is room, exactly as a note's comments do. `ACRES_COMMENTS` sets how many;
+they come off the page the post was already read from, so they cost no extra request.
+
 **This works in a DM and nowhere else.** A thread link posted in a watched group is ignored,
 and nothing is ever published to the channel. Forum posts are long, frequently half-hidden
 behind the site's points wall, and a channel of them is not what channel mode is for.
@@ -270,6 +276,7 @@ Everything except the token has a working default.
 | `COMMENTS` | `5` | Top comments (with their replies) posted as a follow-up message. `0` disables the extra page fetch. |
 | `ACRES` | `true` | 1point3acres thread links, DM only. `false` turns the feature off entirely. |
 | `ACRES_UA` | unset | Fallback User-Agent for a stored 1point3acres cookie that arrived without one. |
+| `ACRES_COMMENTS` | `10` | Top replies attached to a thread, ranked by 好苗/杂草. `0` disables. Costs no extra request. |
 
 `/status` shows which media path is live: *CDN URL passthrough* means zero bytes moved through
 your machine; *streaming through the bot* means at least one CDN family was refused and is being

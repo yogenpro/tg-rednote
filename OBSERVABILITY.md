@@ -46,7 +46,8 @@ a single note's whole journey comes out with one filter — which is the differe
 | `crash` | Unhandled error on an update | `update_id` |
 
 **`site` names the source when it isn't RedNote.** Lines from the 1point3acres path carry
-`site="1p3a"` on `submission`, `note`, `delivery`, `media_skipped` and `fetch_failed`; RedNote
+`site="1p3a"` on `submission`, `note` (which also carries `comments`, the replies attached),
+`delivery`, `media_skipped` and `fetch_failed`; RedNote
 lines have no `site` key at all, so `site=""` selects them. Its `fetch_failed` kinds are its
 own: `challenge` (Cloudflare), `login` (the forum's notice page), `bad_link`, `network`,
 `empty`.

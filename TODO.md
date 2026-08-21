@@ -12,11 +12,6 @@ notes (images, Ultra-HDR albums, videos, forwarded messages, `.com` and `.cn` li
       handed the bytes — is still unobserved. `auto` mode falls back on a 400, so it should
       self-heal either way.
 
-- [ ] **Only the opening post is delivered.** Replies are often where the value is on that
-      forum, and the page already carries them (`postmessage_<pid>` repeats per post). Worth
-      deciding whether a thread should bring back the top few replies the way a note brings
-      back its comments.
-
 - [ ] **No refresh path for an expired forum session.** A stale cookie is detected and the
       owner is told, but a `cf_clearance` lasts hours to days, so this will be a recurring
       chore. Nothing automatic is possible without running a browser.
@@ -69,6 +64,11 @@ notes (images, Ultra-HDR albums, videos, forwarded messages, `.com` and `.cn` li
   attachments live in a `pattl` block *after* the post cell rather than inside it, and that
   every reply has one too: its only picture belonged to a reply, and would have been posted
   as the author's.
+
+- 1point3acres replies: the top 10 by the post's own 好苗/杂草 score ride in the message with
+  the thread, the way a note's comments do. Ranking is done here because Discuz only serves
+  chronological order, and it deliberately ignores the per-post green/red bar — that is
+  labelled 全局 and measures the author's lifetime reputation, not the reply.
 
 - 1point3acres: thread links in a DM come back as the opening post, with the site's
   `<font class="jammer">` interference and zero-width characters stripped, GBK decoded,

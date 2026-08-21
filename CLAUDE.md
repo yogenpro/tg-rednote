@@ -156,6 +156,15 @@ is Discuz's standing "log in to view attachments" banner and appears on every po
 regardless — it is *not* a gate, and reading it as one warned about a points wall on threads
 that were entirely visible.
 
+**Ranking forum replies: the obvious signal is the wrong one.** Every post shows a green/red
+bar, but it is labelled 全局 — the *author's* lifetime reputation, not the post's score; the
+same user shows identical numbers on every post they make in a thread, which is how it was
+caught. The per-post score is 好苗/杂草, `rec_add_<pid>` and `rec_sub_<pid>`. Discuz serves
+replies chronologically and offers no popularity order (`ordertype=1` only reverses), so
+`parse_replies` ranks them here, off the same page the post came from — no extra request.
+Quotes come out of a reply's text (they repeat a post already on screen) but the quoted name
+is kept as `replying_to`, or the answer reads as a non-sequitur.
+
 **The site is DM-only, and that is enforced in two places.** `_handle_group_message` returns
 before it ever looks for a thread link, and there is no channel path at all — no submission,
 no dedupe, no announcement. Threads are long, often half-paywalled, and the channel is for

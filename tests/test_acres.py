@@ -12,6 +12,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "bot"))
 from app.acres import (  # noqa: E402
     Acres,
     attachment_images,
+    parse_replies,
     AcresError,
     Thread,
     canonical,
@@ -217,6 +218,84 @@ def test_a_quoted_table_does_not_truncate_the_post():
     assert "before" in thread.body and "after" in thread.body
 
 
+# ---- replies ---------------------------------------------------------
+
+def _post(pid, author, body, *, add=0, sub=0, up=999, down=1, starter=False):
+    """One post block in the shape Discuz serves.
+
+    `up`/`down` are the green/red bar, which is labelled 全局 — the author's
+    lifetime reputation. `add`/`sub` are 好苗/杂草 on this post.
+    """
+    return f"""<div id="post_{pid}"><table class="plhin">
+<div itemprop="author" itemscope><span itemprop="name">{author}</span></div>
+{'<img class="authicn vm" src="static/image/common/ico_lz.png" />' if starter else ''}
+<i id="rec_add_{pid}" style="display:none">{add}</i>
+<i id="rec_sub_{pid}" style="display:none">{sub}</i>
+<span>全局：</span>
+<i id="upvote_{pid}" style="color:#16a34a">{up}</i><i id="downvote_{pid}" style="color:#ef4444">{down}</i>
+<td class="t_f" id="postmessage_{pid}">{body}</td>
+</table></div>"""
+
+
+THREAD_PAGE = (
+    '<html><head><base href="https://www.1point3acres.com/bbs/" /></head><body>'
+    + _post(1, "starter", "the opening post", add=120, sub=2, starter=True)
+    # A loud author (huge global bar) with a post nobody liked.
+    + _post(2, "loudmouth", "nobody agreed", add=0, sub=0, up=99999, down=8000)
+    + _post(3, "quiet", "everybody agreed", add=40, sub=1, up=3, down=0)
+    + _post(4, "starter", '<div class="quote"><blockquote><font size="2">'
+            '<a href="x"><font color="#999999">loudmouth 发表于 2026-08-20 09:54:54</font></a>'
+            "</font><br />nobody agreed</blockquote></div>I disagree", add=9, sub=0, starter=True)
+    + _post(5, "downvoted", "widely disliked", add=1, sub=30)
+    + _post(6, "blank", "", add=500, sub=0)
+    + "</body></html>"
+)
+
+
+def test_replies_rank_by_the_posts_own_score_not_the_authors_reputation():
+    replies = parse_replies(THREAD_PAGE, limit=10, starter="starter")
+    assert [c.author for c in replies] == ["quiet", "starter", "loudmouth", "downvoted"]
+    # loudmouth has the biggest 全局 bar on the page and still ranks third.
+    assert replies[0].likes == "39"
+
+
+def test_the_opening_post_is_never_one_of_the_replies():
+    assert "the opening post" not in " ".join(c.text for c in parse_replies(THREAD_PAGE))
+
+
+def test_a_quote_is_stripped_but_the_name_it_answers_survives():
+    reply = next(c for c in parse_replies(THREAD_PAGE) if c.text == "I disagree")
+    assert reply.replying_to == "loudmouth"
+    assert "nobody agreed" not in reply.text
+
+
+def test_the_thread_starter_is_marked_when_they_answer_in_their_own_thread():
+    replies = parse_replies(THREAD_PAGE, starter="starter")
+    assert next(c for c in replies if c.text == "I disagree").location == "OP"
+    assert next(c for c in replies if c.author == "quiet").location == ""
+
+
+def test_a_net_negative_or_zero_score_shows_no_count():
+    replies = parse_replies(THREAD_PAGE)
+    assert next(c for c in replies if c.author == "downvoted").likes == ""
+    assert next(c for c in replies if c.author == "loudmouth").likes == ""
+
+
+def test_an_empty_reply_is_dropped_however_popular():
+    assert not any(c.author == "blank" for c in parse_replies(THREAD_PAGE))
+
+
+def test_the_reply_limit_is_honoured_and_zero_turns_them_off():
+    assert len(parse_replies(THREAD_PAGE, limit=2)) == 2
+    assert parse_replies(THREAD_PAGE, limit=0) == []
+
+
+def test_replies_come_off_the_same_parse_as_the_post():
+    thread = parse_thread(THREAD_PAGE, "https://www.1point3acres.com/home/thread/5", replies=3)
+    assert thread.body == "the opening post"
+    assert len(thread.comments) == 3
+
+
 # ---- credentials -----------------------------------------------------
 
 def test_a_curl_paste_yields_both_the_cookie_and_the_user_agent():
@@ -322,6 +401,34 @@ def acres_bot(tmp_path, *, thread=THREAD, error=None, owner=1):
     bot.acres = FakeAcres(thread, error)
     bot.acres_sender = FakeSender()
     return bot, telegram, state
+
+
+@pytest.mark.asyncio
+async def test_top_replies_ride_in_the_message_with_the_post(tmp_path):
+    from app.comments import Comment
+
+    thread = Thread(
+        tid="9", url="u", title="T", body="short post",
+        comments=[Comment(author="someone", text="a good reply", likes="12")],
+    )
+    bot, telegram, _state = acres_bot(tmp_path, thread=thread)
+    await bot.handle_update(message(LINK))
+    assert len(telegram.sent) == 1  # not split off into a message of its own
+    assert "a good reply" in telegram.texts and "👍 12" in telegram.texts
+
+
+@pytest.mark.asyncio
+async def test_when_the_post_overflows_the_replies_follow_it(tmp_path):
+    from app.comments import Comment
+
+    thread = Thread(
+        tid="9", url="u", title="T", body="x" * 6000,
+        comments=[Comment(author="someone", text="a good reply", likes="12")],
+    )
+    bot, telegram, _state = acres_bot(tmp_path, thread=thread)
+    await bot.handle_update(message(LINK))
+    assert len(telegram.sent) > 1
+    assert "a good reply" in telegram.sent[-1][1]
 
 
 @pytest.mark.asyncio

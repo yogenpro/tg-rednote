@@ -137,6 +137,9 @@ class Thread:
     # what we deliver is knowingly partial and should say so.
     locked: bool = False
     needs_login: bool = False
+    # The best replies on page one, already ranked. They come off the same
+    # fetch as the post, so they cost nothing extra.
+    comments: list = field(default_factory=list)
 
 
 def find_acres_link(text: str) -> str | None:
@@ -394,7 +397,7 @@ def _post_extent(html: str, pid: str, after: int) -> int:
     return following.start() if following else len(html)
 
 
-def parse_thread(html: str, url: str) -> Thread | None:
+def parse_thread(html: str, url: str, *, replies: int = 10) -> Thread | None:
     """Build a Thread from a Discuz viewthread page, or None if it isn't one."""
     match = _BODY_START_RE.search(html)
     if not match:
@@ -430,6 +433,7 @@ def parse_thread(html: str, url: str) -> Thread | None:
     tag = _TAG_RE.search(html)
     if tag:
         thread.forum = plain(tag.group(1))
+    thread.comments = parse_replies(html, limit=replies, starter=thread.author)
     summary = _SUMMARY_RE.search(html)
     if summary:
         # Only the header that belongs to the opening post: anything found
@@ -437,6 +441,88 @@ def parse_thread(html: str, url: str) -> Thread | None:
         if summary.start() < match.start():
             thread.summary = plain(summary.group(1))
     return thread
+
+
+# Replies are the other half of a forum thread, and Discuz serves them on the
+# same page as the opening post — so they cost no extra request.
+#
+# The page is in *chronological* order and there is no way to ask for another:
+# `ordertype=1` only reverses it. The ranking has to be done here, and the
+# signal to rank on is not the obvious one. Each post shows a green/red bar,
+# but it is labelled 全局 — that is the *author's* lifetime reputation, not the
+# post's score, and the same user shows identical numbers on every post they
+# make in a thread. The per-post score is 好苗/杂草: `rec_add_<pid>` and
+# `rec_sub_<pid>`, which do vary post by post.
+_QUOTE_RE = re.compile(r'<div class="quote">.*?</blockquote>\s*</div>', re.S | re.I)
+_QUOTE_AUTHOR_RE = re.compile(r'<font color="#999999">\s*(.*?)\s+\u53d1\u8868\u4e8e', re.S | re.I)
+_AUTHOR_NAME_RE = re.compile(
+    r'<div[^>]*itemprop="author".*?<span[^>]*itemprop="name"[^>]*>(.*?)</span>', re.S | re.I
+)
+_THREAD_STARTER_RE = re.compile(r'ico_lz\.png|\u697c\u4e3b', re.I)
+
+
+def _score(html: str, pid: str, name: str) -> int:
+    match = re.search(rf'<i id="{name}_{pid}"[^>]*>\s*(\d+)\s*</i>', html)
+    return int(match.group(1)) if match else 0
+
+
+def _posts(html: str) -> list[tuple[str, str]]:
+    """(pid, markup) for every post on the page, in the order served."""
+    marks = list(_POST_RE.finditer(html))
+    return [
+        (mark.group(1), html[mark.start() : (marks[i + 1].start() if i + 1 < len(marks) else len(html))])
+        for i, mark in enumerate(marks)
+    ]
+
+
+def parse_replies(html: str, *, limit: int = 10, starter: str = "") -> list:
+    """The best replies on page one, ranked by net 好苗 and cut to `limit`.
+
+    Best-effort like everything else here: a shape this does not recognise
+    yields fewer replies, never a failed thread.
+    """
+    from .comments import Comment
+
+    if limit <= 0:
+        return []
+    scored: list[tuple[int, int, Comment]] = []
+    for order, (pid, block) in enumerate(_posts(html)):
+        if order == 0:
+            continue  # the opening post is the thread, not a reply
+        cell = _BODY_START_RE.search(block)
+        if not cell:
+            continue
+        raw = _body(block, cell)[0]
+        quoted = ""
+        quote = _QUOTE_RE.search(raw)
+        if quote:
+            # The quote repeats a post the reader may already have seen, so it
+            # comes out — but the name stays, or the answer reads as a
+            # non-sequitur.
+            found = _QUOTE_AUTHOR_RE.search(quote.group(0))
+            quoted = plain(found.group(1)) if found else ""
+            raw = raw.replace(quote.group(0), "")
+        text = to_text(raw)[0]
+        if not text:
+            continue
+        author = _AUTHOR_NAME_RE.search(block)
+        name = plain(author.group(1)) if author else ""
+        net = _score(block, pid, "rec_add") - _score(block, pid, "rec_sub")
+        scored.append((
+            -net,
+            order,
+            Comment(
+                author=name,
+                text=text,
+                likes="" if net <= 0 else str(net),
+                # Not a place: the chip marks the thread starter answering in
+                # their own thread, which is usually worth spotting.
+                location="OP" if name and name == starter else "",
+                replying_to=quoted if quoted and quoted != name else "",
+            ),
+        ))
+    scored.sort(key=lambda row: (row[0], row[1]))
+    return [comment for _rank, _order, comment in scored[:limit]]
 
 
 def parse_credentials(text: str) -> tuple[str, str]:
@@ -480,8 +566,9 @@ def looks_like_cookie(text: str) -> bool:
 class Acres:
     """Fetches a thread page with the owner's browser credentials."""
 
-    def __init__(self, timeout: float = 60.0, user_agent: str = DEFAULT_UA):
+    def __init__(self, timeout: float = 60.0, user_agent: str = DEFAULT_UA, replies: int = 10):
         self._ua = user_agent or DEFAULT_UA
+        self._replies = replies
         self._client = httpx.AsyncClient(timeout=timeout, follow_redirects=True)
 
     async def aclose(self) -> None:
@@ -517,7 +604,7 @@ class Acres:
         if response.status_code >= 400:
             raise AcresError("network", f"1point3acres returned HTTP {response.status_code}")
 
-        thread = parse_thread(html, target)
+        thread = parse_thread(html, target, replies=self._replies)
         if thread is None:
             if any(marker in html for marker in _NOTICE_MARKERS):
                 raise AcresError("login", "the forum served a notice page instead of the thread")

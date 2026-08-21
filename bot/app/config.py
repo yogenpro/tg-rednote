@@ -66,6 +66,9 @@ class Config:
     # acres.py on why cf_clearance cares.
     acres: bool = True
     acres_ua: str = ""
+    # Top replies to attach to a thread. They come off the page the post was
+    # already read from, so unlike COMMENTS this costs no extra request.
+    acres_comments: int = 10
     tags_in_caption: bool = True
     comments: int = 5  # top comments to append; 0 disables the extra page fetch
     debug_updates: bool = False
@@ -98,6 +101,7 @@ class Config:
             xhs_proxy=os.environ.get("XHS_PROXY", "").strip(),
             acres=_env_bool("ACRES", True),
             acres_ua=os.environ.get("ACRES_UA", "").strip(),
+            acres_comments=max(0, min(30, _env_int("ACRES_COMMENTS", 10))),
             tags_in_caption=_env_bool("TAGS_IN_CAPTION", True),
             comments=max(0, min(10, _env_int("COMMENTS", 5))),
             debug_updates=_env_bool("DEBUG_UPDATES", False),

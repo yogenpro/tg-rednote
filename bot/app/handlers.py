@@ -60,6 +60,9 @@ OWNER_HELP = HELP + """
 
 # Shown at the foot of a message that has a continuation. Kept short: it costs
 # caption room, which the note's own text would rather have.
+# 1point3acres scores a post with 好苗/杂草 — a thumbs up, not a heart.
+ACRES_LIKE = "👍"
+
 CONTINUED = "continues ↓"
 CONTINUED_COST = 16  # the text, plus the blank line before it
 
@@ -155,7 +158,11 @@ class Bot:
         self.acres_sender: MediaSender | None = None
         self.threads: LRU[Thread] = LRU(maxsize=config.cache_size, ttl=config.cache_ttl_seconds)
         if config.acres:
-            self.acres = Acres(timeout=config.fetch_timeout, user_agent=config.acres_ua)
+            self.acres = Acres(
+                timeout=config.fetch_timeout,
+                user_agent=config.acres_ua,
+                replies=config.acres_comments,
+            )
             self.acres_sender = MediaSender(
                 telegram,
                 mode=config.media_mode,
@@ -588,10 +595,11 @@ class Bot:
 
         items = [MediaItem("photo", url) for url in thread.images]
         log.info(
-            "thread %s: %d char(s), %d image(s)%s, requested by %s",
+            "thread %s: %d char(s), %d image(s), %d repl(ies)%s, requested by %s",
             thread.tid or "?",
             len(thread.body),
             len(items),
+            len(thread.comments),
             " [cached]" if cached else "",
             user_id or chat_id or "?",
             extra=fields(
@@ -600,6 +608,7 @@ class Bot:
                 note=thread.tid,
                 kind="thread",
                 items=len(items),
+                comments=len(thread.comments),
                 cached=cached,
                 locked=thread.locked or thread.needs_login,
             ),
@@ -609,9 +618,19 @@ class Bot:
         # rather than a caption — four times the room for the post's text.
         parts = -(-len(items) // MEDIA_GROUP_LIMIT) if items else 0
         marker = len(f"[{parts}/{parts}] ") if parts > 1 else 0
-        head, overflow = render_thread(
-            thread, limit=CAPTION_LIMIT if items else MESSAGE_LIMIT, reserve=marker
-        )
+        limit = CAPTION_LIMIT if items else MESSAGE_LIMIT
+        head, overflow = render_thread(thread, limit=limit, reserve=marker)
+        # Same order of precedence as a note: the post's own text has first
+        # claim, replies take what is left, and if the post spills over at all
+        # they move to the follow-up wholesale rather than splitting.
+        if overflow:
+            trailing = thread.comments
+        else:
+            with_replies = fit_into_caption(
+                head, thread.comments, limit=limit - marker, like=ACRES_LIKE
+            )
+            trailing = [] if with_replies != head else thread.comments
+            head = with_replies
 
         previous: int | None = None
         if items:
@@ -646,8 +665,8 @@ class Bot:
         else:
             previous = await self._send_and_track(chat_id, head, reply_to=message_id)
 
-        for piece in split_message(overflow, MESSAGE_LIMIT):
-            sent = await self._send_and_track(chat_id, escape(piece), reply_to=previous)
+        for piece in self._follow_up(overflow, trailing, limit=MESSAGE_LIMIT, like=ACRES_LIKE):
+            sent = await self._send_and_track(chat_id, piece, reply_to=previous)
             previous = sent or previous
 
         log.info(
@@ -1085,7 +1104,9 @@ class Bot:
             await self._announce_published(where, in_reply_to, note, report)
 
     @staticmethod
-    def _follow_up(overflow: str, comments: list, *, limit: int = MESSAGE_LIMIT) -> list[str]:
+    def _follow_up(
+        overflow: str, comments: list, *, limit: int = MESSAGE_LIMIT, like: str = "♥"
+    ) -> list[str]:
         """Messages to send after the album: the rest of the text, then comments.
 
         The comments ride in the *last* text message when they fit, so a note
@@ -1096,11 +1117,11 @@ class Bot:
             return pieces
         if pieces:
             room = limit - tg_len(strip_tags(pieces[-1])) - 2
-            block = render_comments(comments, limit=room)
+            block = render_comments(comments, limit=room, like=like)
             if block:
                 pieces[-1] = f"{pieces[-1]}\n\n{block}"
                 return pieces
-        block = render_comments(comments, limit=limit - 16)
+        block = render_comments(comments, limit=limit - 16, like=like)
         if block:
             pieces.append(block)
         return pieces

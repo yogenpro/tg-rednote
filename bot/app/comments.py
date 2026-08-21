@@ -36,7 +36,14 @@ class Comment:
     author: str
     text: str
     likes: str = ""
+    # A metadata chip shown in parentheses after the name. IP location on a
+    # RedNote note; on a forum thread it marks the thread starter's own
+    # replies.
     location: str = ""
+    # Who this is answering, when the source says so. Forum replies quote the
+    # post they answer; without the name a reply reads as a non-sequitur once
+    # the quote itself is stripped out.
+    replying_to: str = ""
     replies: list["Comment"] = field(default_factory=list)
 
 
@@ -106,17 +113,21 @@ async def fetch_comments(
     return parse_comments(response.text, limit=limit)
 
 
-def _render_one(comment: Comment, *, reply: bool) -> str:
+def _render_one(comment: Comment, *, reply: bool, like: str = "♥") -> str:
     bullet = "  ↳" if reply else "💬"
     who = escape(comment.author) if comment.author else "anon"
-    meta = " · ".join(bit for bit in (comment.likes and f"♥ {comment.likes}", comment.location) if bit)
+    if comment.replying_to:
+        who += f" → {escape(comment.replying_to)}"
+    meta = " · ".join(
+        bit for bit in (comment.likes and f"{like} {comment.likes}", comment.location) if bit
+    )
     head = f"{bullet} <b>{who}</b>"
     if meta:
         head += f" <i>({escape(meta)})</i>"
     return f"{head}\n{escape(comment.text)}"
 
 
-def render_comments(comments: list[Comment], *, limit: int) -> str:
+def render_comments(comments: list[Comment], *, limit: int, like: str = "♥") -> str:
     """Render as much of the comment thread as fits in `limit` UTF-16 units.
 
     Whole comments are dropped from the end rather than cut mid-sentence; a
@@ -131,24 +142,29 @@ def render_comments(comments: list[Comment], *, limit: int) -> str:
     used = tg_len(header)
 
     for index, comment in enumerate(comments):
-        rendered = [_render_one(comment, reply=False)]
+        rendered = [_render_one(comment, reply=False, like=like)]
         for child in comment.replies:
-            rendered.append(_render_one(child, reply=True))
+            rendered.append(_render_one(child, reply=True, like=like))
         block = "\n".join(rendered)
         cost = tg_len(_visible(block)) + 2  # separated by a blank line
 
         if used + cost > limit:
             if index == 0:  # keep something rather than nothing
-                skeleton = Comment(comment.author, "", comment.likes, comment.location)
-                fixed = tg_len(_visible(_render_one(skeleton, reply=False))) + 2
+                skeleton = Comment(
+                    comment.author, "", comment.likes, comment.location, comment.replying_to
+                )
+                fixed = tg_len(_visible(_render_one(skeleton, reply=False, like=like))) + 2
                 room = limit - used - fixed - 1  # the ellipsis costs one
                 if room < 20:
                     return ""
                 head, _rest = tg_truncate(comment.text, room)
                 if not head:
                     return ""
-                shortened = Comment(comment.author, f"{head}…", comment.likes, comment.location)
-                blocks.append(_render_one(shortened, reply=False))
+                shortened = Comment(
+                    comment.author, f"{head}…", comment.likes, comment.location,
+                    comment.replying_to,
+                )
+                blocks.append(_render_one(shortened, reply=False, like=like))
             break
         blocks.append(block)
         used += cost
@@ -158,7 +174,9 @@ def render_comments(comments: list[Comment], *, limit: int) -> str:
     return header + "\n\n" + "\n\n".join(blocks)
 
 
-def fit_into_caption(caption_html: str, comments: list[Comment], *, limit: int) -> str:
+def fit_into_caption(
+    caption_html: str, comments: list[Comment], *, limit: int, like: str = "♥"
+) -> str:
     """Append what fits of the comment thread to a caption, or return it unchanged.
 
     Comments ride in the caption so a forwarded album carries them along; they
@@ -167,7 +185,7 @@ def fit_into_caption(caption_html: str, comments: list[Comment], *, limit: int) 
     if not comments:
         return caption_html
     room = limit - tg_len(_visible(caption_html)) - 2
-    block = render_comments(comments, limit=room)
+    block = render_comments(comments, limit=room, like=like)
     return f"{caption_html}\n\n{block}" if block else caption_html
 
 

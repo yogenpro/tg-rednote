@@ -268,6 +268,22 @@ class XhsDownloader:
         )
         self._comment_timeout = min(20.0, timeout)
 
+    def set_cookie(self, cookie: str | None) -> None:
+        """Give the bot's *own* XHS requests the same session as the sidecar.
+
+        The cookie used to reach only the sidecar, which meant a logged-in
+        session helped the signed API and did nothing for the three requests
+        this process makes itself — short-link resolution, the page fallback,
+        and the comment/rendition scrape. That is the same argument the split
+        proxy is built on, and it was never followed through here: the wall
+        that hides a video's renditions is hit by *this* client, not the
+        sidecar's.
+        """
+        if cookie:
+            self._client.headers["cookie"] = cookie
+        else:
+            self._client.headers.pop("cookie", None)
+
     async def aclose(self) -> None:
         await self._client.aclose()
         await self._api.aclose()

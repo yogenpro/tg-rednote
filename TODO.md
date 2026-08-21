@@ -57,9 +57,10 @@ notes (images, Ultra-HDR albums, videos, forwarded messages, `.com` and `.cn` li
       venv process for `docker compose up -d` is the last step.
 - [ ] **No logged-in cookie has ever been tested.** One was set live on 2026-08-20 but carried
       only anonymous cookies (`a1`, `webId`, `acw_tc`, …) with no `web_session`, and made no
-      difference to any fetch. Worth (a) testing a real logged-in cookie, and (b) deciding
-      whether `looks_like_cookie` should warn when `web_session` is absent, since silently
-      storing a useless cookie invites exactly this confusion.
+      difference to any fetch. (b) is now done — a cookie without `web_session` is stored but
+      called out — and so is a prerequisite nobody had noticed: the cookie used to reach only
+      the sidecar, so it could not have helped the page fallback or the rendition scrape even
+      if it had been a real login. (a) is still open and now worth much more.
 - [ ] **Decide whether comments should be cached with the note.** They're re-scraped on every
       send, including cache hits (~1s). Caching them on `Note` would make repeat sends instant
       at the cost of staleness within the 6h TTL.

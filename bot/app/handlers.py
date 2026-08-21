@@ -195,6 +195,10 @@ class Bot:
             )
             if config.acres_telegraph:
                 self.telegraph = Telegraph(timeout=config.http_timeout)
+        # The bot's own XHS fetches share the stored session, not just the
+        # sidecar's (see XhsDownloader.set_cookie).
+        if state.cookie:
+            downloader.set_cookie(state.cookie)
         self.pairing_code: str | None = None
         self.started_at = time.monotonic()
         self._refused: set[int] = set()
@@ -434,6 +438,7 @@ class Bot:
             return
         if command == "/forgetcookie":
             self.state.clear_cookie()
+            self.xhs.set_cookie(None)
             await self._reply(chat_id, "Cookie wiped. Fetches will run unauthenticated.")
             return
         if command == "/forgetacres":
@@ -542,12 +547,24 @@ class Bot:
             return
 
         self.state.set_cookie(value)
-        note = "" if deleted else (
-            "\n\n⚠️ I could not delete your message — delete it manually."
-        )
+        self.xhs.set_cookie(value)
+        warnings = []
+        if not deleted:
+            warnings.append("⚠️ I could not delete your message — delete it manually.")
+        if "web_session=" not in value:
+            # a1/webId/acw_tc are device cookies a logged-out browser hands out
+            # freely. Storing one and calling it healthy is how an afternoon
+            # gets spent wondering why nothing changed.
+            warnings.append(
+                "⚠️ There is no <code>web_session</code> in that, which means it is <b>not "
+                "a logged-in session</b> — just the anonymous device cookies any browser "
+                "gets. It will not open anything a cookieless fetch cannot. Copy the "
+                "<code>Cookie</code> header again from a tab where you are actually signed in."
+            )
         await self._reply(
             chat_id,
-            f"Cookie stored ({len(value)} chars) and marked healthy.{note}",
+            f"Cookie stored ({len(value)} chars) and marked healthy."
+            + ("\n\n" + "\n\n".join(warnings) if warnings else ""),
         )
 
     async def _handle_acres_cookie(

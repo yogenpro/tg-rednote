@@ -49,6 +49,7 @@ class FakeTelegram:
 
 class FakeDownloader:
     def __init__(self, note=None, error=None, comments=()):
+        self.cookie = None
         self.note = note
         self.error = error
         self.comment_list = comments
@@ -62,6 +63,9 @@ class FakeDownloader:
 
     async def enrich(self, note, limit=5):
         return list(self.comment_list)
+
+    def set_cookie(self, cookie):
+        self.cookie = cookie
 
     async def healthy(self):
         return True
@@ -241,6 +245,37 @@ async def test_non_owner_cannot_set_cookie_but_message_is_still_deleted(tmp_path
     assert telegram.deleted == [(8, 55)]
     assert state.cookie is None
     assert "Only the owner" in telegram.texts
+
+
+def test_the_bots_own_fetches_get_the_session_too(tmp_path):
+    """The cookie used to reach only the sidecar, which left the page fallback
+    and the comment/rendition scrape anonymous — the requests that actually
+    hit XHS's walls."""
+    downloader = FakeDownloader(note=NOTE)
+    bot, _telegram, state = make_bot(tmp_path, downloader=downloader, owner=1)
+    assert downloader.cookie is None
+    state.set_cookie("a1=x; web_session=abc")
+    bot2, _t2, _s2 = make_bot(tmp_path, downloader=downloader, owner=1)
+    assert downloader.cookie == "a1=x; web_session=abc"  # picked up at startup
+
+
+@pytest.mark.asyncio
+async def test_a_cookie_without_web_session_is_stored_but_called_out(tmp_path):
+    downloader = FakeDownloader(note=NOTE)
+    bot, telegram, state = make_bot(tmp_path, downloader=downloader, owner=1)
+    await bot.handle_update(message("/cookie a1=abcdefghij; webId=klmnopqrst; acw_tc=uvwxyz012345"))
+    assert state.cookie  # stored, not refused
+    assert "not a logged-in session" in telegram.texts
+    assert "web_session" in telegram.texts
+
+
+@pytest.mark.asyncio
+async def test_a_real_login_is_not_nagged_about(tmp_path):
+    downloader = FakeDownloader(note=NOTE)
+    bot, telegram, state = make_bot(tmp_path, downloader=downloader, owner=1)
+    await bot.handle_update(message("/cookie a1=abcdefghij; web_session=0400698xyz; webId=kl"))
+    assert "not a logged-in session" not in telegram.texts
+    assert downloader.cookie == "a1=abcdefghij; web_session=0400698xyz; webId=kl"
 
 
 @pytest.mark.asyncio

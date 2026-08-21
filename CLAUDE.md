@@ -78,10 +78,20 @@ up, and only re-raises the sidecar's error if that fails too. Verified live on
 `http://xhslink.com/o/5TWUMDydMKo`. Page media comes from `sns-webpic-qc.xhscdn.com/<minute>/…`,
 which is why `media_family` also ignores all-digit leading segments.
 
+**The cookie now reaches the bot's own fetches, not just the sidecar's.** It used to go only
+in the sidecar's request payload, which left short-link resolution, the page fallback and the
+comment/rendition scrape running anonymous — and those are the requests that meet XHS's walls,
+so a logged-in session helped the one hop that was least likely to need it.
+`XhsDownloader.set_cookie` puts it on the client the bot uses, called at startup and whenever
+`/cookie` or `/forgetcookie` runs. Exactly the argument `XHS_PROXY` is built on, applied to
+the other credential.
+
 **A cookie without `web_session` is not a login.** One was set live and changed nothing: the
 same notes failed with and without it. `a1`/`webId`/`acw_tc`/`abRequestId` are anonymous
 device cookies that a logged-out browser hands out freely, so `looks_like_cookie` accepting them
-means a useless cookie can be stored and then marked stale by the next failure.
+means a useless cookie can be stored and then marked stale by the next failure. It is still
+accepted — refusing it would be worse, since the markers are not a reliable test — but storing
+one without `web_session` now says so in the reply.
 
 **Comments come from the note page.** XHS's comment API answers 406 without a signed `x-s`
 header, but `window.__INITIAL_STATE__` embeds the first five top-level comments with replies,

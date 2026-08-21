@@ -40,7 +40,9 @@ a single note's whole journey comes out with one filter — which is the differe
 | `page_fallback` | Sidecar refused, page worked | `reason` |
 | `telegraph_failed` | telegra.ph refused a thread; it fell back to messages | `detail` |
 | `cdn_refused` | Telegram wouldn't fetch a URL | `families`, `recognised` |
+| `renditions` | Video renditions the page listed | `count` |
 | `rendition_swapped` | Oversized video downgraded | `megabytes` |
+| `page_walled` | The note page answered 200 with a wall behind it | `note` |
 | `media_skipped` | Item(s) dropped | `count` |
 | `delivery_empty` | Nothing sent at all | `note` |
 | `poll_error` / `poll_conflict` | Telegram polling trouble | `code` |

@@ -113,6 +113,21 @@ def test_unwrap_login_wall():
     assert _unwrap_login_wall(plain) == plain
 
 
+def test_unwrap_the_security_wall():
+    """XHS's bot check is a second wall shape, and it answers HTTP 200 — so
+    nothing downstream notices it unless it is recognised by name."""
+    from app.xhs import _unwrap_login_wall, is_wall
+
+    wall = (
+        "https://www.xiaohongshu.com/404/sec_kHwJsXEi?source=xhs_sec_server"
+        "&originalUrl=http%3A%2F%2Fwww.xiaohongshu.com%2Fdiscovery%2Fitem%2F6a88"
+    )
+    assert _unwrap_login_wall(wall) == "http://www.xiaohongshu.com/discovery/item/6a88"
+    assert is_wall(wall)
+    assert is_wall("https://www.xiaohongshu.com/website-login/error?redirectPath=x")
+    assert not is_wall("https://www.xiaohongshu.com/explore/6a88")
+
+
 def test_cache_key_prefers_note_id():
     assert cache_key("https://www.xiaohongshu.com/explore/650a?xsec_token=X") == "650a"
     assert cache_key("https://www.xiaohongshu.com/discovery/item/650a?x=1") == "650a"

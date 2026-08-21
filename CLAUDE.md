@@ -60,6 +60,14 @@ just a token or a timestamp (`ci.xiaohongshu.com/<token>`, `sns-webpic-qc.xhscdn
 mixes families, only the item Telegram names in `failed to send message #N` is blamed: a single
 Ultra-HDR image otherwise condemns the ordinary family it travelled with.
 
+**XHS has two walls, and the second one answers HTTP 200.** `/website-login/error?redirectPath=…`
+is the login wall; `/404/sec_<token>?source=xhs_sec_server&originalUrl=…` is its bot check, and
+because it returns 200 with a parseable page, nothing downstream notices — the comment scrape
+just comes back empty and a video's renditions are never found, which reads exactly like a note
+that has neither. Both keep the wanted URL in a query parameter, so `_unwrap_login_wall` handles
+both and `is_wall` names the condition; `enrich` logs `page_walled` rather than returning
+silently. Seen live on 2026-08-21 while investigating a video skipped for size.
+
 **Caption limits are UTF-16 code units on the parsed text.** Markup and href targets are free;
 emoji cost two. `tg_len` exists for this. Measure captions with tags stripped, or the tests lie.
 

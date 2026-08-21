@@ -111,16 +111,25 @@ def _normalise_host(url: str) -> str:
     )
 
 
-def _unwrap_login_wall(url: str) -> str:
-    """XHS bounces unauthenticated hits to /website-login/error?redirectPath=…
+# XHS has two ways of saying no, and both keep the URL we asked for in a query
+# parameter: /website-login/error?redirectPath=… for the login wall, and
+# /404/sec_<token>?source=xhs_sec_server&originalUrl=… for its bot check. The
+# second answers HTTP 200, so nothing downstream notices unless it is named.
+_WALLS = (("website-login/error", "redirectPath"), ("/404/sec_", "originalUrl"))
 
-    The note URL we wanted is inside that parameter, so pull it back out rather
-    than handing the sidecar an error page.
-    """
-    if "website-login/error" not in url:
-        return url
-    target = parse_qs(urlsplit(url).query).get("redirectPath", [""])[0]
-    return unquote(target) if target else url
+
+def _unwrap_login_wall(url: str) -> str:
+    """Recover the note URL from whichever wall XHS bounced us to."""
+    for marker, parameter in _WALLS:
+        if marker in url:
+            target = parse_qs(urlsplit(url).query).get(parameter, [""])[0]
+            return unquote(target) if target else url
+    return url
+
+
+def is_wall(url: str) -> bool:
+    """True when a fetch landed on a wall rather than on the note."""
+    return any(marker in url for marker, _parameter in _WALLS)
 
 
 class XhsError(RuntimeError):
@@ -313,15 +322,29 @@ class XhsDownloader:
             log.info("no page for %s: %s", note.page_url.split("?")[0], type(exc).__name__)
             return []
 
+        if is_wall(str(response.url)):
+            # HTTP 200 with a wall behind it. Left unsaid, this looks exactly
+            # like a note that simply has no comments and no other rendition,
+            # which is a very different problem.
+            log.warning(
+                "the page for %s was walled (%s)", note.note_id or "?",
+                str(response.url).split("?")[0],
+                extra=fields(event="page_walled", note=note.note_id),
+            )
+            return []
+
         if note.kind == "video" and not note.video_variants:
             state = _page_state(response.text)
             data = ((state.get("noteData") or {}).get("data") or {}).get("noteData") or {}
             note.video_variants = video_variants(data.get("video") or {})
-            if note.video_variants:
-                log.debug(
-                    "note %s has %d rendition(s): %s", note.note_id, len(note.video_variants),
-                    ", ".join(f"{size // 1024 // 1024}MB" for _u, size in note.video_variants),
-                )
+            log.info(
+                "note %s: %d rendition(s)%s", note.note_id, len(note.video_variants),
+                (" — " + ", ".join(f"{size // 1024 // 1024}MB" for _u, size in note.video_variants))
+                if note.video_variants else "",
+                extra=fields(
+                    event="renditions", note=note.note_id, count=len(note.video_variants)
+                ),
+            )
         return parse_comments(response.text, limit=limit)
 
     async def healthy(self) -> bool:

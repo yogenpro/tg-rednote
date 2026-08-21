@@ -274,7 +274,13 @@ class MediaSender:
                 extra=fields(event="rendition_swapped", megabytes=size // 1024 // 1024),
             )
             return result
-        raise MediaTooLarge(f">{self._max_bytes // 1024 // 1024} MB, no smaller rendition")
+        # Say how many were on offer: "no smaller rendition" reads the same
+        # whether the note had none to begin with or the page fetch was walled
+        # before it could find them, and those need different fixes.
+        raise MediaTooLarge(
+            f">{self._max_bytes // 1024 // 1024} MB, no smaller rendition "
+            f"({len(item.alternatives)} known)"
+        )
 
     def _naming(self, kind: str, content_type: str, index: int) -> tuple[str, str]:
         fallback_type, fallback_ext = DEFAULT_TYPES[kind]

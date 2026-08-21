@@ -31,7 +31,12 @@ notes (images, Ultra-HDR albums, videos, forwarded messages, `.com` and `.cn` li
       syntax, never run against a real Alloy. `stage.metrics` in particular has moved between
       Promtail/Alloy versions — check it before relying on the PromQL side.
 
-- [ ] **Videos with no rendition under 50 MB are still dropped.** By design — the smaller
+- [ ] **Videos with no rendition under 50 MB are still dropped.** Note that the skip message
+      now says how many renditions were known, and a walled page now logs `page_walled`, so
+      the next occurrence can be told apart from "the page fetch was blocked before it could
+      look". Seen live on note `6a881659…`.
+
+  Original: By design — the smaller
       renditions are tried first (see below) and if none fits, the note is skipped rather than
       posted in a degraded form. A local Bot API server (`telegram-bot-api`, 2 GB limit) is the
       only way to lift the ceiling itself.

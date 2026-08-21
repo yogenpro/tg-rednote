@@ -69,6 +69,10 @@ class Config:
     # Top replies to attach to a thread. They come off the page the post was
     # already read from, so unlike COMMENTS this costs no extra request.
     acres_comments: int = 10
+    # A forum thread is text, so it goes to telegra.ph as one page and comes
+    # back as one link with Instant View. False falls back to chunked
+    # messages, which is also what happens if telegra.ph is unreachable.
+    acres_telegraph: bool = True
     tags_in_caption: bool = True
     comments: int = 5  # top comments to append; 0 disables the extra page fetch
     debug_updates: bool = False
@@ -102,6 +106,7 @@ class Config:
             acres=_env_bool("ACRES", True),
             acres_ua=os.environ.get("ACRES_UA", "").strip(),
             acres_comments=max(0, min(30, _env_int("ACRES_COMMENTS", 10))),
+            acres_telegraph=_env_bool("ACRES_TELEGRAPH", True),
             tags_in_caption=_env_bool("TAGS_IN_CAPTION", True),
             comments=max(0, min(10, _env_int("COMMENTS", 5))),
             debug_updates=_env_bool("DEBUG_UPDATES", False),

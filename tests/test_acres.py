@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import sys
 from pathlib import Path
 
@@ -438,10 +439,36 @@ THREAD = Thread(
 LINK = "https://www.1point3acres.com/home/thread/1186859"
 
 
-def acres_bot(tmp_path, *, thread=THREAD, error=None, owner=1):
+class FakeTelegraph:
+    def __init__(self, url="https://telegra.ph/a-thread-08-21", error=None):
+        self.url = url
+        self.error = error
+        self.pages: list[tuple[str, str, list, str, str]] = []
+        self.accounts = 0
+
+    async def create_account(self, short_name, author_name=""):
+        self.accounts += 1
+        return "tok"
+
+    async def create_page(self, token, title, content, *, author_name="", author_url=""):
+        if self.error:
+            raise self.error
+        self.pages.append((token, title, content, author_name, author_url))
+        return self.url
+
+    async def aclose(self):
+        return None
+
+
+def acres_bot(tmp_path, *, thread=THREAD, error=None, owner=1, telegraph=None):
+    """`telegraph=None` exercises the chunked-message delivery; pass a
+    FakeTelegraph to exercise the page."""
     bot, telegram, state = make_bot(tmp_path, owner=owner)
-    bot.acres = FakeAcres(thread, error)
+    # A copy: publishing records the page on the thread, and the module-level
+    # THREAD would carry that into the next test.
+    bot.acres = FakeAcres(copy.deepcopy(thread) if thread else thread, error)
     bot.acres_sender = FakeSender()
+    bot.telegraph = telegraph
     return bot, telegram, state
 
 
@@ -527,6 +554,71 @@ async def test_the_second_fetch_of_a_thread_is_served_from_cache(tmp_path):
     await bot.handle_update(message(LINK))
     await bot.handle_update(message("https://www.1point3acres.com/bbs/thread-1186859-1-1.html"))
     assert len(bot.acres.calls) == 1
+
+
+# ---- the Telegraph page ----------------------------------------------
+
+@pytest.mark.asyncio
+async def test_a_thread_becomes_one_page_and_one_link(tmp_path):
+    paper = FakeTelegraph()
+    bot, telegram, state = acres_bot(tmp_path, telegraph=paper)
+    await bot.handle_update(message(LINK))
+    assert len(telegram.sent) == 1
+    assert "https://telegra.ph/a-thread-08-21" in telegram.texts
+    # The page keeps the forum author's name, not the bot's.
+    _token, title, _content, author, author_url = paper.pages[0]
+    assert title == "A thread" and author == "someone"
+    assert state.telegraph_token == "tok"
+
+
+@pytest.mark.asyncio
+async def test_the_account_is_made_once_and_reused(tmp_path):
+    paper = FakeTelegraph()
+    bot, _telegram, _state = acres_bot(tmp_path, telegraph=paper)
+    await bot.handle_update(message(LINK))
+    bot.acres.thread_result = Thread(tid="2", url="u", title="Another", body="b")
+    await bot.handle_update(message("https://www.1point3acres.com/home/thread/2"))
+    assert paper.accounts == 1 and len(paper.pages) == 2
+
+
+@pytest.mark.asyncio
+async def test_resending_a_link_hands_back_the_page_that_exists(tmp_path):
+    paper = FakeTelegraph()
+    bot, telegram, _state = acres_bot(tmp_path, telegraph=paper)
+    await bot.handle_update(message(LINK))
+    await bot.handle_update(message(LINK))
+    assert len(paper.pages) == 1  # not a second page for the same thread
+    assert telegram.texts.count("https://telegra.ph/a-thread-08-21") == 2
+
+
+@pytest.mark.asyncio
+async def test_a_telegraph_outage_costs_the_format_not_the_thread(tmp_path):
+    from app.telegraph import TelegraphError
+
+    paper = FakeTelegraph(error=TelegraphError("down"))
+    bot, telegram, _state = acres_bot(tmp_path, telegraph=paper)
+    await bot.handle_update(message(LINK))
+    assert "the post body" in telegram.texts  # fell back to chunked messages
+
+
+@pytest.mark.asyncio
+async def test_the_page_carries_the_post_the_replies_and_the_way_home(tmp_path):
+    from app.comments import Comment
+
+    thread = Thread(
+        tid="9", url="https://www.1point3acres.com/bbs/thread-9-1-1.html", title="T",
+        body="first para\n\nsecond para", images=["https://oss/post.jpg"],
+        comments=[Comment(author="phase", text="a reply", likes="3",
+                          images=["https://oss/reply.jpg"])],
+    )
+    paper = FakeTelegraph()
+    bot, _telegram, _state = acres_bot(tmp_path, thread=thread, telegraph=paper)
+    await bot.handle_update(message(LINK))
+    blob = str(paper.pages[0][2])
+    for expected in ("first para", "second para", "phase", "a reply",
+                     "https://oss/post.jpg", "https://oss/reply.jpg",
+                     "Read it on 1point3acres"):
+        assert expected in blob, expected
 
 
 @pytest.mark.asyncio

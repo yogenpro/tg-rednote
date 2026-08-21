@@ -5,6 +5,11 @@ notes (images, Ultra-HDR albums, videos, forwarded messages, `.com` and `.cn` li
 
 ## Open
 
+- [ ] **A published telegra.ph page is only remembered for the cache TTL.** The URL lives on
+      the cached `Thread`, so a resubmission six hours later publishes a second page for the
+      same thread. The channel path solves the equivalent problem with a `published` index in
+      `state.json`; a thread index would be the same shape, if the litter ever matters.
+
 - [ ] **No thread whose *opening post* has pictures has been delivered yet.** A reply's
       picture has now gone through (thread 1186207), which proves the CDN passthrough works —
       `oss.1p3a.com` answers anonymously and Telegram fetches it. What is still unobserved is
@@ -70,6 +75,11 @@ notes (images, Ultra-HDR albums, videos, forwarded messages, `.com` and `.cn` li
   attachments live in a `pattl` block *after* the post cell rather than inside it, and that
   every reply has one too: its only picture belonged to a reply, and would have been posted
   as the author's.
+
+- 1point3acres → telegra.ph: a thread now comes back as one page and one link with Instant
+  View, carrying the post, its pictures and the top replies with theirs. A deliberate
+  divergence from PLAN §2.1, which rejected Telegraph and is still right for RedNote — see
+  CLAUDE.md. Falls back to chunked messages on ACRES_TELEGRAPH=false or a telegra.ph outage.
 
 - 1point3acres reply pictures: attached to the reply that posted them, linked with 📷 in the
   comment, and delivered as their own album captioned with the author — never merged into the

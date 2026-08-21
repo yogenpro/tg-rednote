@@ -18,7 +18,10 @@ from .acres import (
     parse_credentials,
     render as render_thread,
     reply_gallery,
+    source_nodes,
     thread_id,
+    to_nodes,
+    TRIMMED_NOTE,
 )
 from .acres import looks_like_cookie as looks_like_acres_cookie
 from .cache import LRU
@@ -27,6 +30,7 @@ from .logs import current_rid, fields, new_rid
 from .comments import fit_into_caption, render_comments, strip_tags
 from .media import MEDIA_GROUP_LIMIT, MediaSender, build_caption, split_message, tg_len
 from .state import State, generate_pairing_code
+from .telegraph import Telegraph, TelegraphError, trim
 from .telegram import CAPTION_LIMIT, MESSAGE_LIMIT, Telegram, TelegramError
 from .xhs import MediaItem, Note, XhsDownloader, XhsError, cache_key, find_link
 
@@ -63,6 +67,23 @@ OWNER_HELP = HELP + """
 # caption room, which the note's own text would rather have.
 # 1point3acres scores a post with 好苗/杂草 — a thumbs up, not a heart.
 ACRES_LIKE = "👍"
+
+
+def _page_message(thread: Thread, page: str) -> str:
+    """What comes back when a thread went to telegra.ph.
+
+    The Telegraph link goes first: Telegram previews the first link it finds,
+    and the preview is the point — Instant View opens the whole thread inside
+    the client.
+    """
+    meta = " · ".join(
+        escape(bit) for bit in (thread.author, thread.published.split(" ")[0], thread.forum) if bit
+    )
+    lines = [f'📄 <a href="{escape(page, quote=True)}">{escape(thread.title or "Untitled")}</a>']
+    if meta:
+        lines.append(meta)
+    lines.append(f'<a href="{escape(thread.url, quote=True)}">open on 1point3acres</a>')
+    return "\n".join(lines)
 
 CONTINUED = "continues ↓"
 CONTINUED_COST = 16  # the text, plus the blank line before it
@@ -157,6 +178,7 @@ class Bot:
         # session, and the XHS proxy has no business carrying this traffic.
         self.acres: Acres | None = None
         self.acres_sender: MediaSender | None = None
+        self.telegraph: Telegraph | None = None
         self.threads: LRU[Thread] = LRU(maxsize=config.cache_size, ttl=config.cache_ttl_seconds)
         if config.acres:
             self.acres = Acres(
@@ -171,6 +193,8 @@ class Bot:
                 file_ids=self.file_ids,
                 headers=self.acres.headers(state.acres_cookie, state.acres_ua),
             )
+            if config.acres_telegraph:
+                self.telegraph = Telegraph(timeout=config.http_timeout)
         self.pairing_code: str | None = None
         self.started_at = time.monotonic()
         self._refused: set[int] = set()
@@ -618,6 +642,25 @@ class Bot:
             ),
         )
 
+        if self.telegraph:
+            page = await self._publish_page(thread)
+            if page:
+                await self._reply(
+                    chat_id, _page_message(thread, page), reply_to=message_id, preview=True
+                )
+                log.info(
+                    "delivered thread %s as %s in %.1fs",
+                    thread.tid or "?", page, time.monotonic() - started,
+                    extra=fields(
+                        event="delivery", site="1p3a", note=thread.tid, mode="telegraph",
+                        url=page, items=len(items),
+                        seconds=round(time.monotonic() - started, 1),
+                    ),
+                )
+                return
+            # Falling through on purpose: a telegra.ph outage should cost the
+            # nicer format, not the thread.
+
         # No images means no album, and then the first message is a message
         # rather than a caption — four times the room for the post's text.
         parts = -(-len(items) // MEDIA_GROUP_LIMIT) if items else 0
@@ -706,6 +749,39 @@ class Bot:
                 seconds=round(time.monotonic() - started, 1),
             ),
         )
+
+    async def _publish_page(self, thread: Thread) -> str | None:
+        """The thread as one Telegraph page, or None if that did not work out.
+
+        Never raises: the message-per-chunk delivery is right behind it, and a
+        thread the reader can have in a worse format beats no thread.
+        """
+        if thread.page:
+            return thread.page
+        try:
+            token = self.state.telegraph_token
+            if not token:
+                token = await self.telegraph.create_account("1p3a", "1point3acres")
+                self.state.set_telegraph_token(token)
+                log.info("created a telegra.ph account for this instance")
+            content = trim(
+                to_nodes(thread), tail=source_nodes(thread), note=TRIMMED_NOTE
+            )
+            thread.page = await self.telegraph.create_page(
+                token,
+                thread.title,
+                content,
+                author_name=thread.author,
+                author_url=thread.author_url,
+            )
+            return thread.page
+        except TelegraphError as exc:
+            log.warning(
+                "telegra.ph refused thread %s: %s", thread.tid or "?", exc,
+                extra=fields(event="telegraph_failed", site="1p3a", note=thread.tid,
+                             detail=str(exc)[:200]),
+            )
+            return None
 
     async def _handle_acres_error(
         self, chat_id: int, message_id: int | None, exc: AcresError, user_id: int | None = None
@@ -1265,17 +1341,22 @@ class Bot:
             await self._reply(self.state.owner_id, text)
 
     async def _reply(
-        self, chat_id: int | str | None, text: str, *, reply_to: int | None = None
+        self,
+        chat_id: int | str | None,
+        text: str,
+        *,
+        reply_to: int | None = None,
+        preview: bool = False,
     ) -> None:
         # A group submission has no one to answer: everything the bot would
         # have said is simply not said (and never leaks into the group).
         if chat_id is None:
             return
         try:
-            await self.tg.send_message(chat_id, text, reply_to=reply_to)
+            await self.tg.send_message(chat_id, text, reply_to=reply_to, preview=preview)
         except TelegramError as exc:
             if reply_to and "reply message not found" in exc.description.lower():
-                await self.tg.send_message(chat_id, text)
+                await self.tg.send_message(chat_id, text, preview=preview)
                 return
             log.error("could not reply to %s: %s", chat_id, exc.description)
 
@@ -1285,3 +1366,5 @@ class Bot:
             await self.acres.aclose()
         if self.acres_sender:
             await self.acres_sender.aclose()
+        if self.telegraph:
+            await self.telegraph.aclose()

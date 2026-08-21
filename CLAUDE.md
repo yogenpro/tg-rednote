@@ -28,6 +28,7 @@ bot/app/
   media.py      caption assembly, album chunking, URL-vs-upload delivery
   comments.py   top comments scraped from the note page
   acres.py      1point3acres threads: link shapes, de-jamming, DM-only delivery
+  telegraph.py  telegra.ph client; a forum thread goes out as one page
   state.py      atomic 0600 state.json (owner, allowlist, cookie, health)
   telegram.py   raw Bot API client (429 handling, token redaction)
   cache.py      LRU with TTL
@@ -164,6 +165,21 @@ replies chronologically and offers no popularity order (`ordertype=1` only rever
 `parse_replies` ranks them here, off the same page the post came from — no extra request.
 Quotes come out of a reply's text (they repeat a post already on screen) but the quoted name
 is kept as `replying_to`, or the answer reads as a non-sequitur.
+
+**A thread goes to telegra.ph, and that is a deliberate divergence from PLAN §2.1.** The plan
+rejected Telegraph, and it is still right for RedNote: a note *is* its images, and answering
+with a link to a web page is what this bot exists to avoid. A forum thread inverts the trade —
+thousands of words, pictures incidental — so 1point3acres publishes one page and sends one
+link, which Telegram opens with Instant View. Do not "fix" the inconsistency in either
+direction; the two sites want different things. `ACRES_TELEGRAPH=false` restores chunked
+messages, and so does a telegra.ph outage: `_publish_page` returns None rather than raising,
+and the message path is right behind it. Two API details earn their keep — `createPage` takes
+`author_name`/`author_url` per page, so the forum author keeps the byline rather than the
+bot, and an external image `src` is stored and rendered verbatim (verified against
+oss.1p3a.com), so nothing needs re-hosting. Content is capped at 64 KB, so `trim` drops whole
+nodes from the end — which is why replies are ordered last and the link home is passed as
+`tail` and never dropped. The page URL is cached on the `Thread`, so re-sending a link inside
+the cache TTL hands back the page that exists instead of littering telegra.ph with copies.
 
 **A reply's picture is delivered under the reply's name, not the post's.** Replies carry
 attachments in exactly the same `pattl` shape the opening post does, so `parse_replies`

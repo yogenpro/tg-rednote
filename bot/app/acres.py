@@ -140,6 +140,10 @@ class Thread:
     # The best replies on page one, already ranked. They come off the same
     # fetch as the post, so they cost nothing extra.
     comments: list = field(default_factory=list)
+    # Where this thread was published, once it has been. Cached with the
+    # thread, so re-sending a link inside the cache TTL hands back the page
+    # that exists instead of minting another one.
+    page: str = ""
 
 
 def find_acres_link(text: str) -> str | None:
@@ -717,3 +721,87 @@ GATED_NOTE = (
     "⚠️ Part of this thread sits behind the forum points wall — "
     "open it on 1point3acres for the rest."
 )
+
+
+# ---- Telegraph ------------------------------------------------------
+
+def _paragraphs(text: str) -> list:
+    """Text to <p> nodes, keeping single line breaks as <br>.
+
+    A forum post uses both: blank lines separate sections, single newlines are
+    a list or a set of figures. Splitting on every newline would space the
+    second kind out into unreadable drifts of paragraphs.
+    """
+    nodes = []
+    for block in text.split("\n\n"):
+        lines = [line for line in block.split("\n") if line.strip()]
+        if not lines:
+            continue
+        children: list = []
+        for index, line in enumerate(lines):
+            if index:
+                children.append({"tag": "br"})
+            children.append(line)
+        nodes.append({"tag": "p", "children": children})
+    return nodes
+
+
+def _figure(url: str, caption: str = "") -> dict:
+    children: list = [{"tag": "img", "attrs": {"src": url}}]
+    if caption:
+        children.append({"tag": "figcaption", "children": [caption]})
+    return {"tag": "figure", "children": children}
+
+
+def to_nodes(thread: Thread) -> list:
+    """A whole thread as Telegraph content: post, pictures, then replies.
+
+    Ordered so that `telegraph.trim` cuts from the least valuable end — the
+    post survives, the replies are what a 64 KB page loses first.
+    """
+    nodes: list = []
+    meta = " · ".join(bit for bit in (thread.author, thread.published, thread.forum) if bit)
+    if meta:
+        nodes.append({"tag": "p", "children": [{"tag": "em", "children": [meta]}]})
+    if thread.summary:
+        nodes.append({"tag": "blockquote", "children": [thread.summary]})
+    nodes.extend(_paragraphs(thread.body))
+    if thread.locked or thread.needs_login:
+        nodes.append({"tag": "p", "children": [{"tag": "em", "children": [GATED_NOTE]}]})
+    nodes.extend(_figure(url) for url in thread.images)
+
+    if thread.comments:
+        nodes.append({"tag": "hr"})
+        nodes.append({"tag": "h3", "children": ["Top replies"]})
+        for comment in thread.comments:
+            head: list = [{"tag": "strong", "children": [comment.author or "anon"]}]
+            if comment.replying_to:
+                head.append(f" → {comment.replying_to}")
+            chips = " · ".join(
+                bit for bit in (comment.likes and f"👍 {comment.likes}", comment.location) if bit
+            )
+            if chips:
+                head.append({"tag": "em", "children": [f" ({chips})"]})
+            nodes.append({"tag": "p", "children": head})
+            nodes.extend(_paragraphs(comment.text))
+            nodes.extend(_figure(url) for url in comment.images)
+
+    return nodes
+
+
+def source_nodes(thread: Thread) -> list:
+    """The link home. Handed to `telegraph.trim` as the tail it must keep: a
+    page that dropped half a thread for length needs the original more, not
+    less."""
+    return [
+        {"tag": "hr"},
+        {
+            "tag": "p",
+            "children": [
+                {"tag": "a", "attrs": {"href": thread.url}, "children": ["Read it on 1point3acres"]}
+            ],
+        },
+    ]
+
+
+TRIMMED_NOTE = "This thread was too long for one page; the rest is on 1point3acres."

@@ -123,18 +123,24 @@ logged.
 ### 1point3acres threads
 
 A link to a [1point3acres](https://www.1point3acres.com) thread — any of `/home/thread/<id>`,
-`/interview/thread/<id>` or the old `/bbs/thread-<id>-1-1.html` — comes back as the opening
-post: title, author, the text, and any images the post carries.
+`/interview/thread/<id>` or the old `/bbs/thread-<id>-1-1.html` — comes back as a
+[telegra.ph](https://telegra.ph) page and a single link, which Telegram opens with Instant
+View. The page carries the opening post, its pictures, and the top replies with theirs.
 
-The top replies come with it — ranked by the post's own 好苗/杂草 score, not by the page's
-chronological order, and not by the green/red bar next to each post (that one is labelled
-全局 and measures the *author's* reputation, not the reply). They ride in the same message as
-the post when there is room, exactly as a note's comments do. `ACRES_COMMENTS` sets how many;
-they come off the page the post was already read from, so they cost no extra request.
+This is the opposite of what the bot does for RedNote, on purpose. A note *is* its images, so
+it comes back as native media; a forum thread is thousands of words with the pictures
+incidental, and chunking that into four Telegram messages reads far worse than one page. Set
+`ACRES_TELEGRAPH=false` for the chunked-message form — which is also the automatic fallback if
+telegra.ph is unreachable, so an outage costs the format and not the thread.
 
-If a reply has a picture attached, the reply gets a 📷 link and the picture follows in its own
-album, captioned with whose reply it came from — it never joins the opening post's album,
-because an album's caption is the post and that would credit the wrong person.
+Replies are ranked by the post's own 好苗/杂草 score, not by the page's chronological order,
+and not by the green/red bar next to each post — that one is labelled 全局 and measures the
+*author's* lifetime reputation, not the reply. `ACRES_COMMENTS` sets how many; they come off
+the page the post was already read from, so they cost no extra request. A reply's own pictures
+stay with that reply.
+
+**Telegraph pages are public to anyone with the link.** That is the point of the feature, and
+also why it is nowhere near the group and channel paths.
 
 **This works in a DM and nowhere else.** A thread link posted in a watched group is ignored,
 and nothing is ever published to the channel. Forum posts are long, frequently half-hidden
@@ -281,6 +287,7 @@ Everything except the token has a working default.
 | `ACRES` | `true` | 1point3acres thread links, DM only. `false` turns the feature off entirely. |
 | `ACRES_UA` | unset | Fallback User-Agent for a stored 1point3acres cookie that arrived without one. |
 | `ACRES_COMMENTS` | `10` | Top replies attached to a thread, ranked by 好苗/杂草. `0` disables. Costs no extra request. |
+| `ACRES_TELEGRAPH` | `true` | Publish threads to telegra.ph and reply with the link. `false` sends chunked messages instead, as does a telegra.ph outage. |
 
 `/status` shows which media path is live: *CDN URL passthrough* means zero bytes moved through
 your machine; *streaming through the bot* means at least one CDN family was refused and is being

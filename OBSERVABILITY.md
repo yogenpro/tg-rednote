@@ -33,11 +33,12 @@ a single note's whole journey comes out with one filter — which is the differe
 | `submission` | A link arrives | `source` = `dm` \| `group`, `site` |
 | `note` | Metadata in hand | `kind` = `image` \| `video` \| `thread`, `items`, `cached`, `origin` = `sidecar` \| `page` |
 | `comments` | Comment scrape done | `count` |
-| `delivery` | Media sent | `items`, `seconds`, `mode` = `url` \| `upload`, `skipped` |
+| `delivery` | Media sent | `items`, `seconds`, `mode` = `url` \| `upload` \| `telegraph`, `skipped` |
 | `published` | Live on the channel | `message_id`, `url` |
 | `duplicate` | Already published | `url` of the original |
 | `fetch_failed` | No note | `kind` = `blocked` \| `bad_link` \| `profile` \| `network` \| `empty` |
 | `page_fallback` | Sidecar refused, page worked | `reason` |
+| `telegraph_failed` | telegra.ph refused a thread; it fell back to messages | `detail` |
 | `cdn_refused` | Telegram wouldn't fetch a URL | `families`, `recognised` |
 | `rendition_swapped` | Oversized video downgraded | `megabytes` |
 | `media_skipped` | Item(s) dropped | `count` |

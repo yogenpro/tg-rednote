@@ -46,6 +46,9 @@ class State:
         "acres_ua": None,
         "acres_cookie_set_at": None,
         "acres_cookie_status": "unset",  # unset | ok | stale
+        # One Telegraph account for the instance, so its pages are all
+        # editable and revocable from one token. Created on first publish.
+        "telegraph_token": None,
         "last_successful_fetch": None,
         # note_id -> {"chat": str, "message_id": int, "at": iso}. Keeps a
         # resubmitted link from posting to the channel twice.
@@ -111,6 +114,14 @@ class State:
     @property
     def acres_cookie_status(self) -> str:
         return self.data.get("acres_cookie_status") or "unset"
+
+    @property
+    def telegraph_token(self) -> str | None:
+        return self.data.get("telegraph_token") or None
+
+    def set_telegraph_token(self, token: str) -> None:
+        self.data["telegraph_token"] = token
+        self.save()
 
     def is_allowed(self, user_id: int) -> bool:
         return user_id in self.allowlist

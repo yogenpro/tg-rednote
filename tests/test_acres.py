@@ -93,9 +93,19 @@ def test_jammers_never_reach_the_text():
     assert "First line." in text and "Second line." in text and "Third line." in text
 
 
+def test_the_standing_attachment_banner_is_not_read_as_a_gate():
+    # Discuz prints `attach_nopermission attach_tips` at the top of every post
+    # cell whether or not there is an attachment, and whether or not you are
+    # logged in — treating it as a gate warns about nothing on every thread.
+    _text, _images, _locked, needs_login = to_text(PAGE)
+    assert not needs_login
+    # A bare attach_nopermission wraps one attachment the reader cannot have.
+    assert to_text('<div class="attach_nopermission">x</div>')[3]
+
+
 def test_a_points_wall_is_marked_rather_than_spliced_over():
-    text, _images, locked, needs_login = to_text(PAGE)
-    assert locked and needs_login
+    text, _images, locked, _needs_login = to_text(PAGE)
+    assert locked
     assert "本帖隐藏" not in text  # the wall's own blurb is not the post
     # The wall is a <div>, so it breaks the line the way a browser would; what
     # matters is that the gap is visible rather than silently sewn shut.
@@ -142,7 +152,9 @@ def test_parse_pulls_the_opening_post_apart():
     assert thread.published == "2023-6-16 15:34"
     assert thread.forum == "数科面经"
     assert "2023(4-6月)" in thread.summary
-    assert thread.locked and thread.needs_login
+    assert thread.locked
+    # The standing "log in to view attachments" banner is not a gate.
+    assert not thread.needs_login
 
 
 def test_attachments_are_taken_over_thumbnails_and_chrome_is_dropped():

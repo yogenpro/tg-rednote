@@ -222,7 +222,13 @@ class _Extractor(HTMLParser):
             self.locked = True
             if self._skip_depth is None:
                 self.chunks.append(" […] ")
-        elif hidden in ("attach_nopermission", "attach_tips"):
+        elif hidden == "attach_nopermission" and "attach_tips" not in (attrs.get("class") or ""):
+            # `attach_nopermission attach_tips` together is Discuz's standing
+            # "log in to view attachments" banner: the template prints it at
+            # the top of every post cell, attachments or not, logged in or not
+            # (verified live — it is there on a thread the cookie read in
+            # full). Only a bare `attach_nopermission`, which wraps one
+            # attachment the reader may not have, means something is missing.
             self.needs_login = True
 
         if tag in _VOID_TAGS:

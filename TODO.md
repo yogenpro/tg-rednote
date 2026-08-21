@@ -5,14 +5,11 @@ notes (images, Ultra-HDR albums, videos, forwarded messages, `.com` and `.cn` li
 
 ## Open
 
-- [ ] **1point3acres has never fetched a real thread.** Everything is built and unit-tested
-      against real archived markup, and the failure path is confirmed live (the site answers
-      an anonymous request with a Cloudflare managed challenge, as designed). What is untested
-      is the path *with* a cookie: whether `cf_clearance` from the owner's browser gets a
-      200 from this process, whether attachments come back as `zoomfile`/`file` URLs the way
-      the Discuz templates suggest, and whether Telegram will fetch an `oss.1p3a.com` image
-      or has to be handed the bytes. Send `/acres <Copy as cURL>` and a thread link to find
-      out — that is the whole remaining test.
+- [ ] **Attachments are still unproven.** The first live thread had none, so the image path —
+      `zoomfile`/`file` URLs off a Discuz attachment, and whether Telegram will fetch
+      `oss.1p3a.com` directly or has to be handed the bytes — has never run. `auto` mode
+      falls back on a 400, so it should self-heal, but it is written from the templates
+      rather than from observation. Send a thread with pictures in it.
 
 - [ ] **Only the opening post is delivered.** Replies are often where the value is on that
       forum, and the page already carries them (`postmessage_<pid>` repeats per post). Worth
@@ -61,6 +58,13 @@ notes (images, Ultra-HDR albums, videos, forwarded messages, `.com` and `.cn` li
       spawns a task. Fine for single-digit users, a problem if the allowlist ever grows.
 
 ## Recently done (context for the above)
+
+- 1point3acres, confirmed live on 2026-08-21: a real thread (1186859) fetched with the
+  owner's browser session and delivered in 1.3s — 4462 characters, correct title, author,
+  forum and date, no jammer leakage. The first fetch also turned up a false positive:
+  Discuz prints its "log in to view attachments" banner at the top of every post cell
+  regardless, so a fully readable thread was being labelled as behind the points wall.
+  Fixed — only a bare `attach_nopermission` counts.
 
 - 1point3acres: thread links in a DM come back as the opening post, with the site's
   `<font class="jammer">` interference and zero-width characters stripped, GBK decoded,

@@ -162,6 +162,15 @@ every rendition with a declared `size` (h264 full quality, h265 at roughly half 
 same page fetch that collects comments (`XhsDownloader.enrich`), so it costs no extra request.
 If nothing fits the note is skipped — deliberately, rather than posting a degraded stand-in.
 
+**Shutdown is bounded, and `stopped` is the proof.** A 409 exit was seen live to log
+`shutting down` and then sit indefinitely holding an established connection to Telegram; the
+same path against a local stub exits instantly, so the culprit was never pinned down. Rather
+than guess which client stuck, the three `aclose()` calls run under a 10s `wait_for` and the
+process leaves regardless. That matters because a *hung* process still looks alive to anything
+watching the pid — only the heartbeat notices. `stopped` is logged after cleanup, so if a hang
+ever recurs, its position relative to that line says whether it is in this code or in the event
+loop's own teardown.
+
 **Container health is a heartbeat, not a port.** The bot writes `HEARTBEAT_PATH` after every
 successful `getUpdates`; the HEALTHCHECK fails if it's older than 180s. Long polling has nothing
 to probe, and "process is up" would stay green through a crash-loop.

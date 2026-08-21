@@ -49,6 +49,8 @@ a single note's whole journey comes out with one filter — which is the differe
 | `delivery_empty` | Nothing sent at all | `note` |
 | `poll_error` / `poll_conflict` | Telegram polling trouble | `code` |
 | `crash` | Unhandled error on an update | `update_id` |
+| `shutdown_timeout` | Clients did not close within 10s of exiting | — |
+| `stopped` | Cleanup finished; the process is leaving | — |
 
 **`site` names the source when it isn't RedNote.** Lines from the 1point3acres path carry
 `site="1p3a"` on `submission`, `note` (which also carries `comments`, the replies attached),

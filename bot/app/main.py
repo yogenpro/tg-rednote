@@ -120,9 +120,27 @@ async def run() -> None:
         await poll(bot, telegram, config, stop)
     finally:
         log.info("shutting down")
-        await bot.aclose()
-        await downloader.aclose()
-        await telegram.aclose()
+        # Bounded on purpose. A 409 exit was seen live to log "shutting down"
+        # and then sit there indefinitely, holding an established connection
+        # to Telegram — which a supervisor watching the process (rather than
+        # the heartbeat) reads as healthy forever. Closing these clients is
+        # courtesy; the process is leaving either way. The "stopped" line
+        # below marks the end of the part this code controls, so a future
+        # hang can be told apart from one in the loop's own teardown.
+        try:
+            await asyncio.wait_for(_close(bot, downloader, telegram), timeout=10)
+        except (TimeoutError, asyncio.TimeoutError):
+            log.warning(
+                "clients did not close in 10s; exiting anyway",
+                extra=fields(event="shutdown_timeout"),
+            )
+        log.info("stopped", extra=fields(event="stopped"))
+
+
+async def _close(bot: Bot, downloader: XhsDownloader, telegram: Telegram) -> None:
+    await bot.aclose()
+    await downloader.aclose()
+    await telegram.aclose()
 
 
 def main() -> None:

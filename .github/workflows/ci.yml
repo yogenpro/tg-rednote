@@ -1,26 +1,63 @@
-name: publish
+name: ci
 
 on:
   push:
     branches: [main]
     tags: ["v*"]
+  pull_request:
   workflow_dispatch:
 
 permissions:
   contents: read
-  packages: write
 
 env:
   REGISTRY: ghcr.io
   IMAGE: ${{ github.repository }}
 
 jobs:
-  image:
+  pytest:
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # 3.12 is what the image ships; 3.13 is here to catch deprecations
+        # before they become someone else's upgrade problem.
+        python: ["3.12", "3.13"]
+
     steps:
       - uses: actions/checkout@v7
 
-      # arm64 matters here: the whole point of this bot is running on a home
+      - uses: actions/setup-python@v7
+        with:
+          python-version: ${{ matrix.python }}
+          cache: pip
+          cache-dependency-path: bot/requirements.txt
+
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r bot/requirements.txt pytest
+
+      - name: Test
+        # The suite touches no network, no Telegram and no sidecar, so a
+        # failure here is a real failure and not the weather.
+        run: python -m pytest tests -q
+
+  image:
+    # The gate: nothing reaches the registry until the suite is green on both
+    # interpreters. One workflow rather than a `workflow_run` chain, because
+    # that would re-queue the build and lose the tag ref that names the image.
+    needs: pytest
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - uses: actions/checkout@v7
+
+      # arm64 matters here: the whole point of this bot is running it on a home
       # machine, and plenty of those are Raspberry Pis.
       - uses: docker/setup-qemu-action@v4
       - uses: docker/setup-buildx-action@v4

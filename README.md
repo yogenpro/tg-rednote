@@ -1,7 +1,6 @@
 # RedNote → Telegram
 
-[![tests](https://github.com/yogenpro/tg-rednote/actions/workflows/tests.yml/badge.svg)](https://github.com/yogenpro/tg-rednote/actions/workflows/tests.yml)
-[![publish](https://github.com/yogenpro/tg-rednote/actions/workflows/publish.yml/badge.svg)](https://github.com/yogenpro/tg-rednote/actions/workflows/publish.yml)
+[![ci](https://github.com/yogenpro/tg-rednote/actions/workflows/ci.yml/badge.svg)](https://github.com/yogenpro/tg-rednote/actions/workflows/ci.yml)
 
 A self-hosted Telegram bot. Share a Xiaohongshu (RedNote) link with it; it replies with the
 note's images or video and its text, as native Telegram media.
@@ -375,7 +374,7 @@ The tag is pinned deliberately — the API surface moved between releases (`main
 config, the event vocabulary and the queries worth keeping. Cookie values are never logged, including in
 tracebacks, and message text is only logged with `DEBUG_UPDATES=true`.
 
-**Prebuilt image.** Every push to `main` publishes a multi-arch image (amd64 and arm64, so a
+**Prebuilt image.** Every push to `main` whose tests pass publishes a multi-arch image (amd64 and arm64, so a
 Raspberry Pi works) to the GitHub Container Registry:
 
 ```bash

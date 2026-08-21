@@ -19,13 +19,6 @@ notes (images, Ultra-HDR albums, videos, forwarded messages, `.com` and `.cn` li
       has yet gone through an actual Tailscale exit node. Check both IPs differ once the home
       machine is advertising itself as one.
 
-- [ ] **Group listening is untested live.** Unit tests cover publish-silently, ignore-chatter,
-      stranger-added groups and the `my_chat_member` transitions, but no real group has been
-      wired up yet.
-
-- [ ] **Resubmission dedupe is unverified live.** Publishing and discussion threading were both
-      confirmed against a real channel, but nobody has yet sent the same link twice to see the
-      "Already on the channel" path in the wild.
 - [ ] **No way to unpublish.** The bot has `can_delete_messages` in both chats and
       `state.forget_published()` exists, but no command is wired up. Removing a post today means
       deleting it by hand *and* the note staying in the dedupe index.
@@ -50,6 +43,11 @@ notes (images, Ultra-HDR albums, videos, forwarded messages, `.com` and `.cn` li
       spawns a task. Fine for single-digit users, a problem if the allowlist ever grows.
 
 ## Recently done (context for the above)
+
+- Group listening and dedupe, both confirmed live on 2026-08-21: a real group has been
+  publishing submissions silently for a day, and a note resubmitted there by a second user
+  resolved to the existing post (`6a870863…` → `/gradient_canopy/75`) in 0.3s off the cache
+  instead of republishing.
 
 - CI: one workflow, two jobs. `pytest` runs the suite on 3.12 and 3.13 for every push and
   PR; `image` needs it, so nothing reaches `ghcr.io/yogenpro/tg-rednote` on a red suite.

@@ -71,7 +71,13 @@ class Telegram:
     def __init__(self, token: str, api_base: str = "https://api.telegram.org", timeout: float = 60.0):
         self._token = token
         self._url = f"{api_base}/bot{token}"
-        self._client = httpx.AsyncClient(timeout=timeout)
+        # trust_env=False is the one proxy invariant worth making unbreakable.
+        # Everything else the bot fetches is proxied by default (PROXY, exported
+        # into the environment at startup), and httpx picks env proxies up
+        # silently — so without this, turning the proxy on would quietly route
+        # Telegram, uploads included, down a home link that has no business
+        # carrying them.
+        self._client = httpx.AsyncClient(timeout=timeout, trust_env=False)
 
     async def aclose(self) -> None:
         await self._client.aclose()

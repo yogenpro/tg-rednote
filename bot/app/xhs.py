@@ -324,12 +324,14 @@ class XhsDownloader:
 
         The sidecar sits on the compose network one hop away; sending that hop
         through a proxy would be pointless and, if the proxy is down, fatal to
-        requests that would otherwise work.
+        requests that would otherwise work. trust_env=False is what holds that
+        line now that the proxy is exported into the environment as the default
+        for everything else — see `Telegram` for the same pinning.
         """
         self._base = base_url.rstrip("/")
         self._proxy = proxy or None
         # To the sidecar: local, direct.
-        self._api = httpx.AsyncClient(timeout=timeout)
+        self._api = httpx.AsyncClient(timeout=timeout, trust_env=False)
         # To XHS: short-link redirects and the note page a comment scrape reads.
         self._client = httpx.AsyncClient(
             timeout=timeout, headers=BROWSER_HEADERS, proxy=self._proxy
@@ -478,7 +480,8 @@ class XhsDownloader:
         if cookie:
             payload["cookie"] = cookie
         if self._proxy:
-            # The sidecar does its own fetching, so it needs telling separately.
+            # The sidecar does its own fetching in its own container, so the
+            # environment the bot exports the proxy into cannot reach it.
             payload["proxy"] = self._proxy
         try:
             response = await self._api.post(f"{self._base}/xhs/detail", json=payload)

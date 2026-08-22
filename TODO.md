@@ -124,9 +124,12 @@ notes (images, Ultra-HDR albums, videos, forwarded messages, `.com` and `.cn` li
 - Page fallback: when the sidecar's signed API refuses a note, the note is read off its own
   web page instead (`page.py`). Rescued a note that failed three times live.
 
-- Split routing: `XHS_PROXY` sends every XHS-bound request (sidecar fetches, short-link
-  resolution, comment scrape, media downloads) through a proxy while Telegram goes direct.
-  Optional `tailscale` compose profile provides one via a tailnet exit node, userspace mode.
+- Split routing: `PROXY` sends everything the bot fetches — XHS, the sidecar's own fetches,
+  1point3acres, the CDNs behind them, and anything added later — through a proxy, while
+  Telegram, telegra.ph and the sidecar hop go direct. Default-on rather than an allowlist
+  since 2026-08-22; the three exemptions are pinned with `trust_env=False` so no environment
+  variable can move them. Optional `tailscale` compose profile provides the proxy via a
+  tailnet exit node, userspace mode.
 
 - Packaging: image builds and runs as uid 10001, heartbeat-based HEALTHCHECK, defaults that let
   `docker run` work without compose, `.dockerignore`, optional `.env`, log caps, ordered start

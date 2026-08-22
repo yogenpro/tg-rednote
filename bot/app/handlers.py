@@ -192,11 +192,12 @@ class Bot:
             mode=config.media_mode,
             max_bytes=config.max_upload_bytes,
             file_ids=self.file_ids,
-            proxy=config.xhs_proxy,
+            proxy=config.proxy,
         )
         # 1point3acres: its own client, cache and sender. The sender needs
         # separate headers — the forum serves attachments only to a logged-in
-        # session, and the XHS proxy has no business carrying this traffic.
+        # session — but the same proxy: PROXY is every fetch the bot makes, not
+        # a site-specific route.
         self.acres: Acres | None = None
         self.acres_sender: MediaSender | None = None
         self.telegraph: Telegraph | None = None
@@ -206,6 +207,7 @@ class Bot:
                 timeout=config.fetch_timeout,
                 user_agent=config.acres_ua,
                 replies=config.acres_comments,
+                proxy=config.proxy,
             )
             self.acres_sender = MediaSender(
                 telegram,
@@ -213,6 +215,7 @@ class Bot:
                 max_bytes=config.max_upload_bytes,
                 file_ids=self.file_ids,
                 headers=self.acres.headers(state.acres_cookie, state.acres_ua),
+                proxy=config.proxy,
             )
             if config.acres_telegraph:
                 self.telegraph = Telegraph(timeout=config.http_timeout)
@@ -1137,7 +1140,7 @@ class Bot:
             ),
             f"allowlist: {len(self.state.allowlist)} user(s)",
             f"watching: {len(self.state.groups)} group(s)",
-            *([f"xhs via: {escape(self.config.xhs_proxy)}"] if self.config.xhs_proxy else []),
+            *([f"fetching via: {escape(self.config.proxy)}"] if self.config.proxy else []),
             *(
                 [
                     f"channel: {escape(self.channel['title'])}"

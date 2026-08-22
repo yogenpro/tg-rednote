@@ -106,7 +106,7 @@ in the sidecar's request payload, which left short-link resolution, the page fal
 comment/rendition scrape running anonymous — and those are the requests that meet XHS's walls,
 so a logged-in session helped the one hop that was least likely to need it.
 `XhsDownloader.set_cookie` puts it on the client the bot uses, called at startup and whenever
-`/cookie` or `/forgetcookie` runs. Exactly the argument `XHS_PROXY` is built on, applied to
+`/cookie` or `/forgetcookie` runs. Exactly the argument `PROXY` is built on, applied to
 the other credential.
 
 **A cookie without `web_session` is not a login.** One was set live and changed nothing: the
@@ -162,12 +162,26 @@ the next message's permalink. The link is added by *editing* after the whole seq
 predicting message ids breaks as soon as anything interleaves — and caption room is reserved for
 it up front.
 
-**XHS traffic can be routed separately from Telegram** (`XHS_PROXY`). The split matters because
-the bot itself makes three of the four XHS requests — short-link resolution, the comment scrape
-and media downloads — so proxying only the sidecar would miss most of it. `XhsDownloader` keeps
-two clients for this reason: `_api` (the sidecar hop, never proxied) and `_client` (XHS, proxied),
-and it passes the same proxy to the sidecar in the request payload, which upstream honours
-(verified: a dead proxy turns a working fetch into a failure). Telegram is never proxied.
+**The proxy is a default, not a route to a named site** (`PROXY`; `XHS_PROXY` is the old name,
+still read). It was an allowlist first — "XHS-bound traffic" — and that shape leaks by
+construction: telegra.ph, 1point3acres and `oss.1p3a.com` were all exiting from the server
+because nobody had marked them, and so would anything added next. Inverted on 2026-08-22, so
+the question is now which destinations argue their way *out* of the proxy. Three do: Telegram
+(largest payloads, wants a reliable link rather than a residential IP), telegra.ph (same trade),
+and the hop to the sidecar (one container to the next — proxying it would be pointless and a
+dead proxy would break a request that never leaves the machine).
+
+Mechanically it is two halves, and both are needed. `main.export_proxy` puts the proxy in
+`os.environ` as HTTP_PROXY/HTTPS_PROXY/ALL_PROXY, which httpx reads whenever `trust_env` is on
+— so a client written here in a year is proxied without anyone remembering to pass an argument.
+That is only safe because the three exemptions are pinned at construction with
+`trust_env=False`, in code rather than configuration. Without that pin, setting the proxy would
+quietly route Telegram, uploads included. The sidecar is a separate process, so it is told
+separately in the request payload, which upstream honours (verified: a dead proxy turns a
+working fetch into a failure). `NO_PROXY` covers localhost and the sidecar's own host as belt
+and braces. Note what proxying 1point3acres implies: `cf_clearance` is commonly bound to the
+IP that solved the challenge, so the exit should match the browser the `/acres` paste came
+from.
 
 **Telegram caps bot uploads at 50 MB** and XHS serves video well past it. The note page lists
 every rendition with a declared `size` (h264 full quality, h265 at roughly half the bytes), so

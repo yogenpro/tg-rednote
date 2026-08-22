@@ -61,10 +61,15 @@ class Config:
     # a submission, "private" answers the sender and publishes nothing. It is
     # only the default — each user can set their own with /mode.
     dm_mode: str = "channel"
-    # Proxy for XHS-bound traffic only. Telegram is never proxied: it is not
-    # the connection that needs a residential IP, and routing it through a
-    # home link would only add latency and a failure mode.
-    xhs_proxy: str = ""
+    # Proxy for *everything the bot fetches*, not a named site: XHS, the
+    # sidecar's own fetches, 1point3acres, every CDN behind them, and anything
+    # added later. Three destinations are exempt, and they are exempt in code
+    # rather than here (`trust_env=False`), so no environment variable can ever
+    # route them: Telegram, telegra.ph and the hop to the sidecar. None of the
+    # three wants a residential IP, and sending them down a home link would buy
+    # latency and a failure mode. The default is an allowlist inverted — an
+    # unproxied request has to be argued for, not remembered.
+    proxy: str = ""
     # 1point3acres threads, delivered wherever note links are. Nothing to
     # configure beyond the browser User-Agent used when the stored cookie
     # didn't come with one — see acres.py on why cf_clearance cares.
@@ -107,7 +112,12 @@ class Config:
             poll_timeout=_env_int("POLL_TIMEOUT", 30),
             channel_id=os.environ.get("CHANNEL_ID", "").strip(),
             dm_mode=_env_choice("DM_MODE", "channel", {"channel", "private"}),
-            xhs_proxy=os.environ.get("XHS_PROXY", "").strip(),
+            # XHS_PROXY was the old name, from when the proxy carried XHS and
+            # nothing else. Still honoured so a deployed .env keeps working.
+            proxy=(
+                os.environ.get("PROXY", "").strip()
+                or os.environ.get("XHS_PROXY", "").strip()
+            ),
             acres=_env_bool("ACRES", True),
             acres_ua=os.environ.get("ACRES_UA", "").strip(),
             acres_comments=max(0, min(30, _env_int("ACRES_COMMENTS", 10))),

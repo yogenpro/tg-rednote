@@ -72,7 +72,10 @@ def trim(
 class Telegraph:
     def __init__(self, timeout: float = 30.0, base_url: str = API_BASE):
         self._base = base_url.rstrip("/")
-        self._client = httpx.AsyncClient(timeout=timeout)
+        # Exempt from PROXY for the same reason as Telegram, and pinned the same
+        # way: publishing a page wants a reliable link, not a residential IP.
+        # See the Telegram client on why trust_env=False rather than a setting.
+        self._client = httpx.AsyncClient(timeout=timeout, trust_env=False)
 
     async def aclose(self) -> None:
         await self._client.aclose()

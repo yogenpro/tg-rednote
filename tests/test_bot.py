@@ -9,6 +9,7 @@ import sys
 from html import unescape
 from pathlib import Path
 
+import httpx
 import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "bot"))
@@ -877,45 +878,120 @@ def test_rendered_comments_escape_html():
 
 
 # ---- split routing ---------------------------------------------------
+#
+# PROXY is every fetch the bot makes, not a named site's route. Three
+# destinations are exempt and say so themselves, because the failure is silent
+# in both directions: a proxied Telegram upload merely takes the scenic route,
+# and an unproxied XHS fetch merely gets login-walled.
 
-def test_only_xhs_traffic_takes_the_proxy():
-    """The residential IP is for XHS. Telegram and the sidecar go direct."""
+PROXY = "http://tailscale:1055"
+
+
+def proxy_of(client) -> str | None:
+    """The proxy httpx will actually dial, or None for a direct client.
+
+    Read off the transports rather than the constructor arguments, because that
+    is where an explicit `proxy=` and one inherited from the environment end up
+    looking the same — which is the question these tests ask. httpx hangs a
+    proxied transport off `_mounts` rather than replacing the default one, so
+    both places have to be looked at.
+    """
+    for transport in [*client._mounts.values(), client._transport]:
+        url = getattr(getattr(transport, "_pool", None), "_proxy_url", None)
+        if url:
+            return f"{url.scheme.decode()}://{url.host.decode()}:{url.port}"
+    return None
+
+
+def test_the_proxy_carries_everything_the_bot_fetches():
+    from app.acres import Acres
     from app.media import MediaSender
+    from app.xhs import XhsDownloader
+
+    # The note page (short links, comments), the forum, and the CDN behind both.
+    assert proxy_of(XhsDownloader("http://xhs-downloader:5556", proxy=PROXY)._client) == PROXY
+    assert proxy_of(MediaSender(FakeTelegram(fail_urls=False), proxy=PROXY)._client) == PROXY
+    assert proxy_of(Acres(proxy=PROXY)._client) == PROXY
+
+
+def test_telegram_telegraph_and_the_sidecar_go_direct():
+    """The three exemptions, argued rather than assumed.
+
+    Telegram moves the largest payloads and wants a reliable link, not a
+    residential IP; telegra.ph is the same trade; the sidecar hop never leaves
+    the compose network, so a dead proxy must not be able to break it.
+    """
+    from app.telegraph import Telegraph
     from app.telegram import Telegram
     from app.xhs import XhsDownloader
 
-    def proxy_of(client) -> str | None:
-        """The proxy httpx will actually dial, or None for a direct client.
+    assert proxy_of(Telegram("123:abc")._client) is None
+    assert proxy_of(Telegraph()._client) is None
+    assert proxy_of(XhsDownloader("http://xhs-downloader:5556", proxy=PROXY)._api) is None
 
-        httpx hangs a proxied transport off `_mounts` rather than replacing the
-        default one, so both places have to be looked at.
-        """
-        for transport in [*client._mounts.values(), client._transport]:
-            url = getattr(getattr(transport, "_pool", None), "_proxy_url", None)
-            if url:
-                return f"{url.scheme.decode()}://{url.host.decode()}:{url.port}"
-        return None
 
-    proxy = "http://tailscale:1055"
-    downloader = XhsDownloader("http://xhs-downloader:5556", proxy=proxy)
-    sender = MediaSender(FakeTelegram(fail_urls=False), proxy=proxy)
-    telegram = Telegram("123:abc")
+def test_the_exemptions_hold_against_the_environment():
+    """The invariant worth pinning: not a setting, a property of the client.
 
-    # The note page (short links, comments) and the CDN ride the proxy…
-    assert proxy_of(downloader._client) == "http://tailscale:1055"
-    assert proxy_of(sender._client) == "http://tailscale:1055"
-    # …the hop to the sidecar next door does not…
-    assert proxy_of(downloader._api) is None
-    # …and neither does Telegram, which has no reason to leave by that door.
-    assert proxy_of(telegram._client) is None
+    main.export_proxy puts the proxy in os.environ so a client written later is
+    proxied without anyone remembering to pass it. That is only safe because
+    these three opt out with trust_env=False.
+    """
+    from app.telegraph import Telegraph
+    from app.telegram import Telegram
+    from app.xhs import XhsDownloader
+
+    os.environ["HTTPS_PROXY"] = PROXY
+    os.environ["ALL_PROXY"] = PROXY
+
+    assert proxy_of(Telegram("123:abc")._client) is None
+    assert proxy_of(Telegraph()._client) is None
+    assert proxy_of(XhsDownloader("http://xhs-downloader:5556")._api) is None
+    # …while a client that says nothing is carried by it, which is the default
+    # the whole arrangement exists to invert.
+    assert proxy_of(httpx.AsyncClient()) == PROXY
+
+
+def test_export_proxy_makes_it_the_default():
+    from app.config import Config
+    from app.main import export_proxy
+
+    export_proxy(Config(bot_token="t", proxy=PROXY, downloader_url="http://xhs-downloader:5556"))
+
+    assert proxy_of(httpx.AsyncClient()) == PROXY
+    # Nothing that stays on this machine should go looking for a proxy.
+    assert "xhs-downloader" in os.environ["NO_PROXY"]
+    assert "127.0.0.1" in os.environ["NO_PROXY"]
+
+
+def test_export_proxy_does_not_overrule_the_operator():
+    from app.config import Config
+    from app.main import export_proxy
+
+    os.environ["HTTPS_PROXY"] = "http://mine:3128"
+    export_proxy(Config(bot_token="t", proxy=PROXY))
+    assert os.environ["HTTPS_PROXY"] == "http://mine:3128"
+
+
+def test_xhs_proxy_is_still_honoured_as_the_old_name(monkeypatch):
+    from app.config import Config
+
+    monkeypatch.setenv("TG_BOT_TOKEN", "t")
+    monkeypatch.delenv("PROXY", raising=False)
+    monkeypatch.setenv("XHS_PROXY", PROXY)
+    assert Config.from_env().proxy == PROXY
 
 
 def test_no_proxy_configured_changes_nothing():
+    from app.config import Config
+    from app.main import export_proxy
     from app.xhs import XhsDownloader
 
+    export_proxy(Config(bot_token="t"))
     downloader = XhsDownloader("http://xhs-downloader:5556")
     assert downloader._proxy is None
     assert downloader._client._mounts == {}
+    assert proxy_of(httpx.AsyncClient()) is None
 
 
 @pytest.mark.asyncio

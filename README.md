@@ -325,29 +325,41 @@ streamed instead. Both happen in normal use — see the findings below.
 
 ---
 
-## Giving XHS a different exit
+## Giving the fetching a different exit
 
 The reason to run this at home is the IP: XHS login-walls datacenter ranges. If you would
-rather run the bot on a server, you can keep just the **XHS-bound** traffic on a home
-connection and leave Telegram on the server's own link.
+rather run the bot on a server, you can keep the traffic that *fetches* on a home connection
+and leave the traffic that *publishes* on the server's own link.
 
-Note what "XHS-bound" covers — it is not only the sidecar:
+`PROXY` is that line, and it is drawn as a default rather than a list. Everything the bot
+fetches goes through it — including work it has not been taught yet — and exactly three
+destinations are exempt:
 
-| Request | Made by |
-|---|---|
-| Note data | sidecar |
-| Short-link resolution (`xhslink.com`) | bot |
-| Comment scrape (note page) | bot |
-| Media download when streaming through | bot |
+| Destination | Through the proxy? | Why |
+|---|---|---|
+| XHS pages, short links, its CDN | yes | the walls this exists for |
+| Sidecar's own note fetch | yes | passed as a per-request `proxy`; it fetches XHS itself |
+| 1point3acres and `oss.1p3a.com` | yes | a fetch is a fetch |
+| Anything added later | yes | inherited from the environment, not remembered |
+| **Telegram** | never | moves the largest payloads, wants a reliable link, not a residential IP |
+| **telegra.ph** | never | publishing, same trade as Telegram |
+| **The sidecar hop** | never | one container to the next; a dead proxy must not break it |
 
-Three of the four come from the bot, so routing the sidecar's network namespace alone would
-leave most of it exiting from the server. `XHS_PROXY` covers all four: the bot proxies its own
-XHS requests and passes the same proxy to the sidecar, which honours a per-request `proxy`.
-The Telegram client and the hop to the sidecar are never proxied.
+The three exemptions are pinned in code with `trust_env=False`, not by configuration, so no
+environment variable — yours, the host's, or one set by accident — can route them.
 
 ```
-XHS_PROXY=http://tailscale:1055
+PROXY=http://tailscale:1055
 ```
+
+`XHS_PROXY` is still read as the old name for the same setting, from when the proxy carried
+XHS and nothing else.
+
+One consequence to weigh before turning it on: the forum's `cf_clearance` is issued to the
+browser that solved Cloudflare's challenge, and clearance is commonly bound to that client's
+IP as well as its User-Agent. If the `/acres` paste comes from a browser on the home network,
+proxying makes the session *more* consistent; if it comes from somewhere else, expect to
+re-paste it.
 
 Any HTTP proxy works. The compose file ships an optional Tailscale one that exits through a
 machine on your tailnet — a Raspberry Pi at home, say:
@@ -356,7 +368,7 @@ machine on your tailnet — a Raspberry Pi at home, say:
 # .env
 TS_AUTHKEY=tskey-auth-...     # Tailscale admin console → Settings → Keys
 TS_EXIT_NODE=home-pi          # the home machine, advertising itself as an exit node
-XHS_PROXY=http://tailscale:1055
+PROXY=http://tailscale:1055
 
 docker compose --profile tailscale up -d
 ```
@@ -372,14 +384,14 @@ Sanity checks once it's up:
 ```bash
 docker compose exec tailscale tailscale status | head -3
 docker compose exec tailscale tailscale ip -4
-# what XHS would see:
+# what a fetch would see:
 docker compose exec bot python -c "import httpx;print(httpx.get('https://api.ipify.org',proxy='http://tailscale:1055').text)"
 # and what Telegram sees, which should differ:
-docker compose exec bot python -c "import httpx;print(httpx.get('https://api.ipify.org').text)"
+docker compose exec bot python -c "import httpx;print(httpx.get('https://api.ipify.org',trust_env=False).text)"
 ```
 
-`/status` shows the proxy when one is set. If the proxy dies, XHS fetches fail while the bot
-stays up and answers — it does not silently fall back to the server's own IP.
+`/status` shows the proxy when one is set. If the proxy dies, fetches fail while the bot stays
+up and answers — it does not silently fall back to the server's own IP.
 
 ---
 

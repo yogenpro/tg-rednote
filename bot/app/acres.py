@@ -668,10 +668,23 @@ def looks_like_cookie(text: str) -> bool:
 class Acres:
     """Fetches a thread page with the owner's browser credentials."""
 
-    def __init__(self, timeout: float = 60.0, user_agent: str = DEFAULT_UA, replies: int = 10):
+    def __init__(
+        self,
+        timeout: float = 60.0,
+        user_agent: str = DEFAULT_UA,
+        replies: int = 10,
+        proxy: str = "",
+    ):
         self._ua = user_agent or DEFAULT_UA
         self._replies = replies
-        self._client = httpx.AsyncClient(timeout=timeout, follow_redirects=True)
+        # Proxied like every other fetch. Worth knowing what that means here:
+        # cf_clearance is issued to the browser that solved the challenge, and
+        # Cloudflare commonly binds it to that client's IP as well as its UA —
+        # so the exit the proxy gives this traffic should be the one the /acres
+        # paste came from, or the session can be refused on the next fetch.
+        self._client = httpx.AsyncClient(
+            timeout=timeout, follow_redirects=True, proxy=proxy or None
+        )
 
     async def aclose(self) -> None:
         await self._client.aclose()

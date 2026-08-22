@@ -7,10 +7,11 @@
 #   docker compose logs -f bot
 
 services:
-  # Optional: send XHS-bound traffic out through a machine on your tailnet
-  # (a home box) while Telegram keeps using this host's own connection.
-  # Enable with `docker compose --profile tailscale up -d` and set
-  # XHS_PROXY=http://tailscale:1055 in .env. See the README.
+  # Optional: send the traffic that fetches out through a machine on your
+  # tailnet (a home box), while the traffic that publishes — Telegram and
+  # telegra.ph — keeps using this host's own connection. Enable with
+  # `docker compose --profile tailscale up -d` and set
+  # PROXY=http://tailscale:1055 in .env. See the README.
   tailscale:
     image: tailscale/tailscale:stable
     container_name: xhs-tailscale

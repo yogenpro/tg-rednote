@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import signal
 import sys
 import time
+from urllib.parse import urlsplit
 
 from .config import Config
 from .logs import fields, setup_logging
@@ -16,6 +18,29 @@ from .telegram import Telegram, TelegramError
 from .xhs import XhsDownloader
 
 log = logging.getLogger("xhsbot")
+
+
+def export_proxy(config: Config) -> None:
+    """Make the proxy the default for every fetch, including ones not yet written.
+
+    httpx reads HTTP_PROXY/HTTPS_PROXY/ALL_PROXY whenever `trust_env` is on,
+    which it is unless a client says otherwise — so a client added here in a
+    year is proxied without anyone having to remember to pass an argument. That
+    is the whole point of the inversion: an unproxied destination has to argue
+    for itself. The three that do are pinned with `trust_env=False` at their
+    construction (Telegram, telegra.ph, the sidecar hop) and cannot be reached
+    by this; NO_PROXY is belt and braces for anything else that never leaves
+    the machine. `setdefault`, so an operator who sets these by hand wins.
+    """
+    if not config.proxy:
+        return
+    for name in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY"):
+        os.environ.setdefault(name, config.proxy)
+    local = {"localhost", "127.0.0.1"}
+    host = urlsplit(config.downloader_url).hostname
+    if host:
+        local.add(host)
+    os.environ.setdefault("NO_PROXY", ",".join(sorted(local)))
 
 
 def beat(config: Config) -> None:
@@ -75,9 +100,10 @@ async def guard(bot: Bot, update: dict) -> None:
 async def run() -> None:
     config = Config.from_env()
     setup_logging(config.log_format)
+    export_proxy(config)
     state = State(config.state_path)
     telegram = Telegram(config.bot_token, config.api_base, config.http_timeout)
-    downloader = XhsDownloader(config.downloader_url, config.fetch_timeout, config.xhs_proxy)
+    downloader = XhsDownloader(config.downloader_url, config.fetch_timeout, config.proxy)
     bot = Bot(config, state, telegram, downloader)
 
     try:
@@ -99,7 +125,7 @@ async def run() -> None:
         # Only worth saying with a channel: without one every DM is private
         # anyway, and the default decides nothing.
         f" dm-default={config.dm_mode}" if bot.channel else "",
-        f" xhs-proxy={config.xhs_proxy}" if config.xhs_proxy else "",
+        f" proxy={config.proxy}" if config.proxy else "",
         extra=fields(
             event="startup",
             media_mode=config.media_mode,
@@ -108,7 +134,7 @@ async def run() -> None:
             channel=bool(config.channel_id),
             dm_mode=config.dm_mode,
             groups=len(state.groups),
-            proxied=bool(config.xhs_proxy),
+            proxied=bool(config.proxy),
         ),
     )
 

@@ -203,8 +203,9 @@ class MediaSender:
         self._refused: set[str] = set()
         self._max_bytes = max_bytes
         self._file_ids = file_ids if file_ids is not None else LRU(maxsize=512)
-        # The CDN is XHS too: when XHS traffic is routed somewhere specific,
-        # media downloads belong on the same path.
+        # A download is a fetch like any other: when the bot's traffic is
+        # routed somewhere specific, the bytes go the same way as the page that
+        # named them — XHS's CDN and the forum's alike.
         self._client = httpx.AsyncClient(
             timeout=timeout,
             follow_redirects=True,

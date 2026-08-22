@@ -830,6 +830,21 @@ async def test_a_thread_and_a_note_with_the_same_id_do_not_collide(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_a_private_user_gets_the_thread_in_the_dm_and_the_channel_gets_nothing(tmp_path):
+    paper = FakeTelegraph()
+    bot, telegram, state = acres_bot(tmp_path, telegraph=paper)
+    with_channel(bot, state)
+    await bot.handle_update(message("/mode private"))
+    telegram.sent.clear()
+
+    await bot.handle_update(message(LINK))
+
+    assert [chat for chat, _t in telegram.sent] == [1]
+    assert "telegra.ph" in telegram.texts
+    assert state.published("1p3a:1186859") is None
+
+
+@pytest.mark.asyncio
 async def test_the_challenge_tells_the_owner_how_to_fix_it_and_marks_the_cookie_stale(tmp_path):
     bot, telegram, state = acres_bot(tmp_path, error=AcresError("challenge", "cf"))
     state.set_acres_cookie("cf_clearance=x; _auth=y", "UA/1")

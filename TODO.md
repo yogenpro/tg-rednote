@@ -1,6 +1,6 @@
 # TODO
 
-Status as of 2026-08-22. Tests: 232 passing. The bot has been exercised live against ~15 real
+Status as of 2026-08-22. Tests: 244 passing. The bot has been exercised live against ~15 real
 notes (images, Ultra-HDR albums, videos, forwarded messages, `.com` and `.cn` links).
 
 ## Open
@@ -134,6 +134,8 @@ notes (images, Ultra-HDR albums, videos, forwarded messages, `.com` and `.cn` li
 
 - Channel mode: submissions published to `CHANNEL_ID`, permalink back to the submitter,
   persistent dedupe, startup permission check, `/status` and `/help` reflect it.
+- Per-user DM mode: `/mode private` opts a user's DMs out of being submissions (answered in the
+  chat, nothing published, no dedupe); `DM_MODE` sets the default. Group links are unaffected.
 - Continuation links: each message points at the next one's permalink, so a forwarded post
   still leads to its overflow. (Replaced the discussion-thread experiment, which was reverted —
   forwarded posts lose their thread.)

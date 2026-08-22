@@ -717,6 +717,138 @@ async def test_without_a_channel_nothing_changes(tmp_path):
     assert state.published("650a") is None
 
 
+# ---- whose channel is it: the per-user DM setting ---------------------
+
+@pytest.mark.asyncio
+async def test_private_mode_answers_the_dm_and_publishes_nothing(tmp_path):
+    bot, telegram, state = channel_bot(tmp_path)
+    await bot.handle_update(message("/mode private"))
+
+    await bot.handle_update(message("http://xhslink.com/o/x"))
+
+    assert bot.sender.sends[0][0] == 1  # the submitter's own chat
+    assert "Published to" not in telegram.texts
+    assert state.published("650a") is None
+
+
+@pytest.mark.asyncio
+async def test_switching_back_to_channel_publishes_again(tmp_path):
+    bot, telegram, state = channel_bot(tmp_path)
+    await bot.handle_update(message("/mode private"))
+    await bot.handle_update(message("/mode channel"))
+    bot.sender.next_message_id = 42
+
+    await bot.handle_update(message("http://xhslink.com/o/x"))
+
+    assert bot.sender.sends[0][0] == -1001234567890
+    assert "https://t.me/mychannel/42" in telegram.texts
+
+
+@pytest.mark.asyncio
+async def test_the_choice_survives_a_restart(tmp_path):
+    _bot, _telegram, state = channel_bot(tmp_path)
+    state.set_dm_mode(1, "private")
+    assert State(state.path).dm_mode(1) == "private"
+    assert State(state.path).dm_mode(2) == "channel"  # everyone else is untouched
+
+
+@pytest.mark.asyncio
+async def test_private_mode_is_per_user(tmp_path):
+    bot, telegram, state = channel_bot(tmp_path)
+    state.allow(2)
+    await bot.handle_update(message("/mode private", user=2))
+    bot.sender.next_message_id = 42
+
+    await bot.handle_update(message("http://xhslink.com/o/x", user=1))
+    assert bot.sender.sends[0][0] == -1001234567890
+
+
+@pytest.mark.asyncio
+async def test_a_private_user_still_feeds_the_channel_from_a_group(tmp_path):
+    """The setting is about DMs. A watched group is a submission by definition,
+    and one member's preference must not silence it for everyone."""
+    bot, telegram, state = channel_bot(tmp_path)
+    state.allow_group(-100, "g", 1)
+    await bot.handle_update(message("/mode private"))
+
+    await bot.handle_update(
+        {
+            "update_id": 2,
+            "message": {
+                "message_id": 5,
+                "from": {"id": 1},
+                "chat": {"id": -100, "type": "supergroup"},
+                "text": "http://xhslink.com/o/x",
+            },
+        }
+    )
+    assert bot.sender.sends[0][0] == -1001234567890
+
+
+@pytest.mark.asyncio
+async def test_private_mode_does_not_consult_the_published_index(tmp_path):
+    """A note already on the channel is still fetchable privately — "someone
+    else published it" is no reason to refuse the sender their own copy."""
+    bot, telegram, state = channel_bot(tmp_path)
+    state.record_published("650a", -1001234567890, 42)
+    await bot.handle_update(message("/mode private"))
+
+    await bot.handle_update(message("http://xhslink.com/o/x"))
+    assert len(bot.sender.sends) == 1
+    assert "Already on the channel" not in telegram.texts
+
+
+@pytest.mark.asyncio
+async def test_bare_mode_reports_where_links_go(tmp_path):
+    bot, telegram, _state = channel_bot(tmp_path)
+    await bot.handle_update(message("/mode"))
+    assert "submissions" in telegram.texts and "/mode private" in telegram.texts
+
+    await bot.handle_update(message("/mode dm"))
+    telegram.sent.clear()
+    await bot.handle_update(message("/mode"))
+    assert "private" in telegram.texts and "/mode channel" in telegram.texts
+
+
+@pytest.mark.asyncio
+async def test_an_unknown_mode_word_changes_nothing(tmp_path):
+    bot, telegram, state = channel_bot(tmp_path)
+    await bot.handle_update(message("/mode sideways"))
+    assert "Usage" in telegram.texts
+    assert state.dm_mode(1) == "channel"
+
+
+@pytest.mark.asyncio
+async def test_without_a_channel_there_is_nothing_to_switch(tmp_path):
+    bot, telegram, state = make_bot(tmp_path, downloader=FakeDownloader(NOTE), owner=1)
+    await bot.handle_update(message("/mode private"))
+    assert "no channel configured" in telegram.texts
+    assert state.dm_mode(1) == "channel"  # nothing stored, nothing to undo
+
+
+@pytest.mark.asyncio
+async def test_dm_mode_env_sets_the_default_and_a_user_can_override_it(tmp_path):
+    bot, telegram, state = channel_bot(tmp_path, dm_mode="private")
+    await bot.handle_update(message("http://xhslink.com/o/x"))
+    assert bot.sender.sends[0][0] == 1  # nobody chose, so the default holds
+
+    await bot.handle_update(message("/mode channel"))
+    await bot.handle_update(message("http://xhslink.com/o/x"))
+    assert bot.sender.sends[1][0] == -1001234567890
+
+
+@pytest.mark.asyncio
+async def test_status_and_help_say_where_a_users_links_go(tmp_path):
+    bot, telegram, _state = channel_bot(tmp_path)
+    await bot.handle_update(message("/mode private"))
+    telegram.sent.clear()
+    await bot.handle_update(message("/status"))
+    await bot.handle_update(message("/help"))
+    assert "your DMs: answered here only" in telegram.texts
+    assert "here only — nothing you send goes to" in telegram.texts
+    assert "/mode" in telegram.texts
+
+
 # ---- the discussion group is not ours to talk in ----------------------
 
 GROUP_ID = -1009999999999

@@ -135,6 +135,19 @@ the bot degrades to answering submitters directly instead of failing per-submiss
 note ids live in `state.json` (`published`, newest 1000) so a resubmitted link returns the
 existing post rather than duplicating it.
 
+**Whether a DM is a submission is the sender's call, not the deployment's.** `CHANNEL_ID`
+used to decide for everyone: configure a channel and every DM link became a submission, which
+is wrong for the ordinary case of wanting to *read* something. `/mode private` opts a user out
+and `state.dm_modes` remembers it; `DM_MODE` only sets the default for whoever never chose.
+Mechanically, `_publishes(user_id)` answers the question once per submission, and
+`_handle_link`/`_handle_acres_link` take a `publish` flag and bind `channel = self.channel if
+publish else None` at the top — every channel test inside those two methods reads that local,
+which is what makes private mode fall down exactly the path a bot with no channel takes.
+Two consequences worth keeping: a group link is a submission regardless (watching a group is
+the point of watching it, and one member's preference must not silence it for everyone), and
+the dedupe index is not consulted in private mode — "someone already published it" is no reason
+to refuse a reader their own copy.
+
 **Groups hear exactly one thing: the finished post.** `_handle_link(chat_id=None, …)` is the
 silent path — `_reply(None, …)` is a no-op, so progress and failures can't leak into a group —
 while `announce_to=(chat, message)` carries the permalink back as a reply to the message that

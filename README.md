@@ -121,6 +121,7 @@ logged.
 |---|---|---|
 | *(bare link)* | allowlist | Fetch and post the note |
 | `/status` | allowlist | Cookie age and health, last successful fetch, sidecar reachability, cache stats |
+| `/mode channel` · `/mode private` | allowlist | In channel mode: whether your DMs are submissions or stay in the chat. Bare `/mode` reports the current setting |
 | `/cookie <value>` | owner | Store the XHS cookie; the message is deleted on receipt |
 | `/forgetcookie` | owner | Wipe the stored cookie |
 | `/acres <cookie or cURL>` | owner | Store the 1point3acres session; the message is deleted on receipt |
@@ -218,6 +219,28 @@ for the same reason: a forwarded post loses its thread, so the reader can't reac
 ignores linked discussion groups entirely, which is also why it never talks back to people
 commenting on a post.
 
+#### DMs that aren't submissions
+
+Channel mode turns *everyone's* DMs into submissions, which is not always what the people on
+the allowlist want — sometimes a link is just something you want to read, not something you are
+proposing for the feed. So the choice is theirs, per user:
+
+```
+/mode private        what I send stays in this chat
+/mode channel        what I send is a submission (the default)
+/mode                which one am I on?
+```
+
+In `private` mode a link is fetched and answered in the DM exactly as it would be with no
+channel configured: nothing is posted, nothing is recorded in the published index, and the
+duplicate check doesn't apply — a note already on the channel is still delivered privately to
+whoever asks for it. `DM_MODE=private` flips the default for users who have never chosen; an
+explicit `/mode` always wins, and it survives restarts.
+
+The setting is about direct messages only. A link in a **watched group** is a submission
+regardless — that is what watching a group means, and one member's preference must not silence
+it for everyone else.
+
 #### Collecting links from groups
 
 Add the bot to a group and links posted there become submissions too. It stays quiet there
@@ -247,7 +270,7 @@ posts once.
 * **Submitters aren't named in the channel.** Who sent a link stays between them and the bot.
 * Permalinks are `https://t.me/<name>/<id>` for a public channel and `https://t.me/c/<id>/<id>`
   for a private one — the latter only opens for channel members.
-* `/status` reports the channel and how many notes have been published.
+* `/status` reports the channel, how many notes have been published, and where your own DMs go.
 
 ### What comes back
 
@@ -289,6 +312,7 @@ Everything except the token has a working default.
 | `LOG_FORMAT` | `text` | `json` gives one structured object per line for Alloy/Loki — see [OBSERVABILITY.md](OBSERVABILITY.md). |
 | `DEBUG_UPDATES` | `false` | Dumps every incoming update, message text included. Diagnostics only — a mistyped cookie would land in the log. |
 | `CHANNEL_ID` | unset | `@name` or `-100…`. Set it to run in channel mode — see below. |
+| `DM_MODE` | `channel` | What a DM means in channel mode: `channel` (a submission) or `private` (answered in the chat). Only the default — each user sets their own with `/mode`. |
 | `COMMENTS` | `5` | Top comments (with their replies) posted as a follow-up message. `0` disables the extra page fetch. |
 | `ACRES` | `true` | 1point3acres thread links, in DMs, watched groups and the channel alike. `false` turns the feature off entirely. |
 | `ACRES_UA` | unset | Fallback User-Agent for a stored 1point3acres cookie that arrived without one. |
@@ -483,10 +507,10 @@ runs it.
 uv run --python 3.12 --with 'httpx==0.28.1' --with pytest python -m pytest tests -q
 ```
 
-232 tests, no network, Telegram or sidecar required: link parsing, payload normalisation across
+244 tests, no network, Telegram or sidecar required: link parsing, payload normalisation across
 both of the downloader's locales, caption budgeting against Telegram's UTF-16 limits, album
-chunking, the URL→upload fallback, the pairing/allowlist/cookie paths, channel mode, and the
-1point3acres path from jammer-stripping to the Telegraph page.
+chunking, the URL→upload fallback, the pairing/allowlist/cookie paths, channel mode and the
+per-user DM setting, and the 1point3acres path from jammer-stripping to the Telegraph page.
 
 ```
 bot/app/

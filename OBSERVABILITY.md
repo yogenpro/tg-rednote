@@ -29,13 +29,14 @@ a single note's whole journey comes out with one filter — which is the differe
 
 | `event` | When | Fields worth querying |
 |---|---|---|
-| `startup` | Process start | `media_mode`, `comments`, `channel`, `groups`, `proxied` |
-| `submission` | A link arrives | `source` = `dm` \| `group`, `site` |
+| `startup` | Process start | `media_mode`, `comments`, `channel`, `dm_mode` (the default for users who never chose), `groups`, `proxied` |
+| `submission` | A link arrives | `source` = `dm` \| `group`, `site`, `private` (a DM the sender keeps out of the channel) |
 | `note` | Metadata in hand | `kind` = `image` \| `video` \| `thread`, `items`, `cached`, `origin` = `sidecar` \| `page` |
 | `comments` | Comment scrape done | `count` |
 | `delivery` | Media sent | `items`, `seconds`, `mode` = `url` \| `upload` \| `telegraph`, `skipped` |
 | `published` | Live on the channel | `message_id`, `url` |
 | `duplicate` | Already published | `url` of the original |
+| `dm_mode` | Someone changed where their DMs go | `user`, `mode` = `channel` \| `private` |
 | `fetch_failed` | No note | `kind` = `blocked` \| `bad_link` \| `profile` \| `network` \| `empty` |
 | `page_fallback` | Sidecar refused, page worked | `reason` |
 | `telegraph_failed` | telegra.ph refused a thread; it fell back to messages | `detail` |
@@ -174,6 +175,12 @@ sum by (mode) (count_over_time({service="tg-rednote", event="delivery"} | json [
 **How is the forum session holding up?** (a run of these means the cookie needs refreshing)
 ```logql
 sum by (kind) (count_over_time({service="tg-rednote", event="fetch_failed"} | json | site="1p3a" [24h]))
+```
+
+**How much of the DM traffic is people keeping to themselves?** (in channel mode: a high
+`private="true"` share means the feed is seeing less than the bot is fetching)
+```logql
+sum by (private) (count_over_time({service="tg-rednote"} | json | event="submission" | source="dm" [24h]))
 ```
 
 **What happened to one specific note?**

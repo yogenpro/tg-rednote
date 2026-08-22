@@ -92,10 +92,13 @@ async def run() -> None:
     bot.bootstrap()
     await bot.check_channel(me)
     log.info(
-        "media mode=%s live-photos=%s cache=%d%s",
+        "media mode=%s live-photos=%s cache=%d%s%s",
         config.media_mode,
         config.live_photos,
         config.cache_size,
+        # Only worth saying with a channel: without one every DM is private
+        # anyway, and the default decides nothing.
+        f" dm-default={config.dm_mode}" if bot.channel else "",
         f" xhs-proxy={config.xhs_proxy}" if config.xhs_proxy else "",
         extra=fields(
             event="startup",
@@ -103,6 +106,7 @@ async def run() -> None:
             live_photos=config.live_photos,
             comments=config.comments,
             channel=bool(config.channel_id),
+            dm_mode=config.dm_mode,
             groups=len(state.groups),
             proxied=bool(config.xhs_proxy),
         ),

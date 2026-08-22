@@ -57,6 +57,10 @@ class Config:
     fetch_timeout: float = 120.0
 
     channel_id: str = ""  # set to publish submissions to a channel
+    # What a DM means when a channel is configured: "channel" makes every link
+    # a submission, "private" answers the sender and publishes nothing. It is
+    # only the default — each user can set their own with /mode.
+    dm_mode: str = "channel"
     # Proxy for XHS-bound traffic only. Telegram is never proxied: it is not
     # the connection that needs a residential IP, and routing it through a
     # home link would only add latency and a failure mode.
@@ -102,6 +106,7 @@ class Config:
             cache_ttl_seconds=_env_int("CACHE_TTL_SECONDS", 6 * 3600),
             poll_timeout=_env_int("POLL_TIMEOUT", 30),
             channel_id=os.environ.get("CHANNEL_ID", "").strip(),
+            dm_mode=_env_choice("DM_MODE", "channel", {"channel", "private"}),
             xhs_proxy=os.environ.get("XHS_PROXY", "").strip(),
             acres=_env_bool("ACRES", True),
             acres_ua=os.environ.get("ACRES_UA", "").strip(),

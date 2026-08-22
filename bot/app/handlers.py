@@ -69,6 +69,22 @@ OWNER_HELP = HELP + """
 ACRES_LIKE = "👍"
 
 
+# What people actually type. "channel" and "private" are the stored values;
+# everything else here is a synonym someone will reach for first.
+MODE_WORDS = {
+    "channel": "channel",
+    "publish": "channel",
+    "submit": "channel",
+    "public": "channel",
+    "on": "channel",
+    "private": "private",
+    "dm": "private",
+    "me": "private",
+    "quiet": "private",
+    "off": "private",
+}
+
+
 def acres_key(tid: str) -> str:
     """The dedupe index is shared with RedNote, so a forum id says so."""
     return f"1p3a:{tid}" if tid else ""
@@ -265,6 +281,63 @@ class Bot:
             f"@{self.channel['username']}" if self.channel["username"] else "private channel",
         )
 
+    def _publishes(self, user_id: int | None) -> bool:
+        """Does a DM from this user become a channel submission?
+
+        A group link always is — that is what watching a group means. A DM is
+        the one place where the answer belongs to the sender, so it is theirs
+        to set; DM_MODE only decides for those who never have.
+        """
+        if not self.channel:
+            return False
+        return self.state.dm_mode(user_id, self.config.dm_mode) == "channel"
+
+    def _mode_line(self, user_id: int | None) -> str:
+        """One sentence on where this user's links go, and how to change it."""
+        where = (
+            f"@{self.channel['username']}"
+            if self.channel["username"]
+            else f"<b>{escape(self.channel['title'])}</b>"
+        )
+        if self._publishes(user_id):
+            return (
+                f"Your links are <b>submissions</b>: I publish them to {where} and send "
+                "you a link to the post.\n\nSend <code>/mode private</code> to keep them "
+                "here between us instead."
+            )
+        return (
+            f"Your links are <b>private</b>: I fetch them and answer here, and nothing "
+            f"goes to {where}.\n\nSend <code>/mode channel</code> to submit them instead."
+        )
+
+    async def _handle_mode(self, chat_id: int, user_id: int, text: str) -> None:
+        if not self.channel:
+            await self._reply(
+                chat_id,
+                "There is no channel configured, so everything I fetch already comes "
+                "straight back to you here.",
+            )
+            return
+        parts = text.split()
+        if len(parts) < 2:
+            await self._reply(chat_id, self._mode_line(user_id))
+            return
+        wanted = MODE_WORDS.get(parts[1].strip().lower())
+        if not wanted:
+            await self._reply(
+                chat_id,
+                "Usage: <code>/mode channel</code> (submit what you send) or "
+                "<code>/mode private</code> (keep it in this chat).\n\n"
+                + self._mode_line(user_id),
+            )
+            return
+        self.state.set_dm_mode(user_id, wanted)
+        log.info(
+            "user %s set dm mode to %s", user_id, wanted,
+            extra=fields(event="dm_mode", user=user_id, mode=wanted),
+        )
+        await self._reply(chat_id, "Noted. " + self._mode_line(user_id))
+
     async def _handle_group_message(self, chat: dict, message: dict) -> None:
         """Publish any RedNote link. The only thing said back is the permalink."""
         chat_id = chat.get("id")
@@ -449,7 +522,7 @@ class Bot:
             await self._reply(chat_id, self._help_text(user_id))
             return
         if command == "/status":
-            await self._handle_status(chat_id)
+            await self._handle_status(chat_id, user_id)
             return
         if command == "/forgetcookie":
             self.state.clear_cookie()
@@ -468,6 +541,9 @@ class Bot:
                 "1point3acres cookie wiped. Threads will fail at the Cloudflare "
                 "challenge until a new one is set.",
             )
+            return
+        if command == "/mode":
+            await self._handle_mode(chat_id, user_id, text)
             return
         if command in ("/allow", "/deny", "/users"):
             await self._handle_admin(chat_id, user_id, command, text)
@@ -495,18 +571,27 @@ class Bot:
                 await self._reply(chat_id, "1point3acres support is switched off here.")
                 return
             current_rid.set(new_rid())
+            publish = self._publishes(user_id)
             log.info(
                 "submission from %s", user_id,
-                extra=fields(event="submission", source="dm", site="1p3a"),
+                extra=fields(
+                    event="submission", source="dm", site="1p3a", private=not publish
+                ),
             )
             await self._handle_acres_link(
-                chat_id, message.get("message_id"), thread, user_id
+                chat_id, message.get("message_id"), thread, user_id, publish=publish
             )
             return
         if link:
             current_rid.set(new_rid())
-            log.info("submission from %s", user_id, extra=fields(event="submission", source="dm"))
-            await self._handle_link(chat_id, message.get("message_id"), link, user_id)
+            publish = self._publishes(user_id)
+            log.info(
+                "submission from %s", user_id,
+                extra=fields(event="submission", source="dm", private=not publish),
+            )
+            await self._handle_link(
+                chat_id, message.get("message_id"), link, user_id, publish=publish
+            )
             return
         if command.startswith("/"):
             await self._reply(chat_id, "Unknown command. /help")
@@ -634,14 +719,20 @@ class Bot:
         user_id: int | None = None,
         *,
         announce_to: tuple[int, int | None] | None = None,
+        publish: bool = True,
     ) -> None:
         """Fetch a forum thread and deliver it.
 
         Same contract as the note flow: `chat_id` is where the submitter is
         waiting — None for a group submission, which produces no progress and
         no errors — and `announce_to` is who to tell about the finished post.
+        `publish` False keeps the thread in the DM it came from even though a
+        channel is configured (/mode private).
         """
         started = time.monotonic()
+        # Everything downstream asks "are we curating a channel?" — which for
+        # one submission also means "is this one meant for it?".
+        channel = self.channel if publish else None
         key = thread_id(link) or link
         thread = self.threads.get(key)
         cached = thread is not None
@@ -687,7 +778,7 @@ class Bot:
         # two sites without saying which is which invites exactly one very
         # confusing bug.
         published_key = acres_key(thread.tid)
-        if self.channel:
+        if channel:
             already = self.state.published(published_key)
             if already:
                 link_back = self.message_link(already["message_id"])
@@ -709,10 +800,10 @@ class Bot:
 
         # Where it goes: the channel if we are curating one, else back to
         # whoever asked. A channel post cannot reply to a user's message.
-        target = self.channel["id"] if self.channel else chat_id
+        target = channel["id"] if channel else chat_id
         if target is None:  # a group submission with nowhere to publish
             return
-        reply_to = None if self.channel else message_id
+        reply_to = None if channel else message_id
 
         if self.telegraph:
             page = await self._publish_page(thread)
@@ -729,7 +820,7 @@ class Bot:
                         seconds=round(time.monotonic() - started, 1),
                     ),
                 )
-                if self.channel:
+                if channel:
                     where, in_reply_to = announce_to or (chat_id, message_id)
                     await self._announce_published(
                         where, in_reply_to, published_key, sent, site="1p3a"
@@ -827,7 +918,7 @@ class Bot:
                 seconds=round(time.monotonic() - started, 1),
             ),
         )
-        if self.channel:
+        if channel:
             where, in_reply_to = announce_to or (chat_id, message_id)
             await self._announce_published(where, in_reply_to, published_key, first, site="1p3a")
 
@@ -931,10 +1022,23 @@ class Bot:
             if self.channel["username"]
             else escape(self.channel["title"])
         )
+        if self._publishes(user_id):
+            opening = (
+                f"Send me a Xiaohongshu share link to submit it to <b>{where}</b>. If the "
+                "fetch works I'll publish it there and send you a link to the post."
+            )
+        else:
+            opening = (
+                "Send me a Xiaohongshu share link and I'll post the note back as native "
+                f"media, here only — nothing you send goes to <b>{where}</b>."
+            )
         return base.replace(
             "Send me a Xiaohongshu share link and I'll post the note back as native media.",
-            f"Send me a Xiaohongshu share link to submit it to <b>{where}</b>. If the fetch "
-            "works I'll publish it there and send you a link to the post.",
+            opening,
+            1,
+        ).replace(
+            "/status — ",
+            "/mode — whether your links are submissions or stay in this chat\n/status — ",
             1,
         )
 
@@ -989,7 +1093,7 @@ class Bot:
             f"Watching <b>{escape(title)}</b>." if added else f"Already watching {escape(title)}.",
         )
 
-    async def _handle_status(self, chat_id: int) -> None:
+    async def _handle_status(self, chat_id: int, user_id: int | None = None) -> None:
         healthy = await self.xhs.healthy()
         uptime = int(time.monotonic() - self.started_at)
         cookie_line = {
@@ -1017,6 +1121,18 @@ class Bot:
                     + (", with UA" if self.state.acres_ua else "")
                 ]
                 if self.acres
+                else []
+            ),
+            *(
+                [
+                    "your DMs: "
+                    + (
+                        "submitted to the channel"
+                        if self._publishes(user_id)
+                        else "answered here only"
+                    )
+                ]
+                if self.channel
                 else []
             ),
             f"allowlist: {len(self.state.allowlist)} user(s)",
@@ -1104,6 +1220,7 @@ class Bot:
         user_id: int | None = None,
         *,
         announce_to: tuple[int, int | None] | None = None,
+        publish: bool = True,
     ) -> None:
         """Fetch a note and deliver it.
 
@@ -1111,8 +1228,11 @@ class Bot:
         submission, which produces no progress or error output at all.
         `announce_to` is (chat, message) to tell about the finished post, which
         for a group submission is the message that carried the link.
+        `publish` False keeps the note in the DM it came from even though a
+        channel is configured (/mode private).
         """
         started = time.monotonic()
+        channel = self.channel if publish else None
         key = cache_key(link)
         note = self.notes.get(key)
         cached = note is not None
@@ -1151,7 +1271,7 @@ class Bot:
 
         # In channel mode a link is a submission, so a resubmission should point
         # at the existing post rather than duplicate it.
-        if self.channel:
+        if channel:
             already = self.state.published(note.note_id)
             if already:
                 link_back = self.message_link(already["message_id"])
@@ -1191,7 +1311,7 @@ class Bot:
         # only known after the caption is built, and 16 units is a cheaper
         # price than rebuilding twice.
         continues = bool(overflow or comments or parts > 1)
-        if self.channel and continues:
+        if channel and continues:
             caption, overflow = build_caption(
                 note, tags=self.config.tags_in_caption, reserve=marker + CONTINUED_COST
             )
@@ -1204,10 +1324,10 @@ class Bot:
 
         # Where the album goes: the channel if we're curating one, else back to
         # whoever asked. A channel post can't reply to a user's message.
-        target = self.channel["id"] if self.channel else chat_id
+        target = channel["id"] if channel else chat_id
         if target is None:  # a group submission with nowhere to publish
             return
-        reply_to = None if self.channel else message_id
+        reply_to = None if channel else message_id
 
         action = "upload_video" if any(item.kind == "video" for item in items) else "upload_photo"
         try:
@@ -1217,14 +1337,14 @@ class Bot:
             log.exception("send failed for note %s", note.note_id)
             await self._reply(
                 chat_id,
-                ("The channel refused the post: " if self.channel else "Telegram refused the media: ")
+                ("The channel refused the post: " if channel else "Telegram refused the media: ")
                 + f"<code>{escape(exc.description)}</code>",
                 reply_to=message_id,
             )
-            if self.channel:
+            if channel:
                 await self._notify_owner(
                     "⚠️ A submission could not be published to "
-                    f"<b>{escape(self.channel['title'])}</b>: "
+                    f"<b>{escape(channel['title'])}</b>: "
                     f"<code>{escape(exc.description)}</code>"
                 )
             return
@@ -1266,7 +1386,7 @@ class Bot:
         # Everything else follows in the same chat, chained onto the post.
         chain: list[tuple[int, str, bool]] = [(mid, cap, True) for mid, cap in report.parts]
         previous = report.first_message_id
-        room = MESSAGE_LIMIT - (CONTINUED_COST if self.channel else 0)
+        room = MESSAGE_LIMIT - (CONTINUED_COST if channel else 0)
         for piece in self._follow_up(overflow, trailing, limit=room):
             sent = await self._send_and_track(target, piece, reply_to=previous)
             if sent:
@@ -1275,13 +1395,13 @@ class Bot:
 
         # A reply chain is invisible once a message is forwarded out of the
         # channel, so each message also carries a link to the next one.
-        if self.channel and len(chain) > 1:
+        if channel and len(chain) > 1:
             await self._link_the_chain(target, chain)
 
         if report.skipped:
             await self._reply(chat_id, "Skipped: " + "; ".join(escape(s) for s in report.skipped))
 
-        if self.channel:
+        if channel:
             where, in_reply_to = announce_to or (chat_id, message_id)
             await self._announce_published(
                 where, in_reply_to, note.note_id, report.first_message_id

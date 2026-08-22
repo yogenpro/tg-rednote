@@ -34,6 +34,10 @@ class State:
         # Group chats whose RedNote links become submissions. A group is added
         # when an allowlisted user adds the bot to it, or by /allowgroup.
         "groups": {},  # str(chat_id) -> {"title": str, "added_by": int, "at": iso}
+        # Per-user DM preference in channel mode: is a link sent in a DM a
+        # submission, or a private fetch answered in the DM itself? Only the
+        # users who have chosen appear here; everyone else follows DM_MODE.
+        "dm_modes": {},  # str(user_id) -> "channel" | "private"
         "pairing_code_used": False,
         "xhs_cookie": None,
         "cookie_set_at": None,
@@ -121,6 +125,23 @@ class State:
 
     def set_telegraph_token(self, token: str) -> None:
         self.data["telegraph_token"] = token
+        self.save()
+
+    DM_MODES = ("channel", "private")
+
+    def dm_mode(self, user_id: int | None, default: str = "channel") -> str:
+        """How this user's DMs are treated. Unset means the instance default."""
+        mode = (self.data.get("dm_modes") or {}).get(str(user_id))
+        return mode if mode in self.DM_MODES else default
+
+    def set_dm_mode(self, user_id: int, mode: str) -> None:
+        """Record a choice even when it matches the current default: the
+        default is an env var and can move under the user's feet."""
+        if mode not in self.DM_MODES:
+            raise ValueError(f"dm mode must be one of {self.DM_MODES}, got {mode!r}")
+        modes = dict(self.data.get("dm_modes") or {})
+        modes[str(user_id)] = mode
+        self.data["dm_modes"] = modes
         self.save()
 
     def is_allowed(self, user_id: int) -> bool:

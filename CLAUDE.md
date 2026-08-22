@@ -27,7 +27,7 @@ bot/app/
   xhs.py        sidecar client, link parsing/resolution, payload normalisation
   media.py      caption assembly, album chunking, URL-vs-upload delivery
   comments.py   top comments scraped from the note page
-  acres.py      1point3acres threads: link shapes, de-jamming, DM-only delivery
+  acres.py      1point3acres threads: link shapes, de-jamming, reply ranking
   telegraph.py  telegra.ph client; a forum thread goes out as one page
   state.py      atomic 0600 state.json (owner, allowlist, cookie, health)
   telegram.py   raw Bot API client (429 handling, token redaction)

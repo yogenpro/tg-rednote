@@ -1,6 +1,6 @@
 # TODO
 
-Status as of 2026-08-21. Tests: 178 passing. The bot has been exercised live against ~15 real
+Status as of 2026-08-22. Tests: 232 passing. The bot has been exercised live against ~15 real
 notes (images, Ultra-HDR albums, videos, forwarded messages, `.com` and `.cn` links).
 
 ## Open

@@ -61,9 +61,9 @@ class Config:
     # the connection that needs a residential IP, and routing it through a
     # home link would only add latency and a failure mode.
     xhs_proxy: str = ""
-    # 1point3acres threads, DM only. Nothing to configure beyond the browser
-    # User-Agent used when the stored cookie didn't come with one — see
-    # acres.py on why cf_clearance cares.
+    # 1point3acres threads, delivered wherever note links are. Nothing to
+    # configure beyond the browser User-Agent used when the stored cookie
+    # didn't come with one — see acres.py on why cf_clearance cares.
     acres: bool = True
     acres_ua: str = ""
     # Top replies to attach to a thread. They come off the page the post was

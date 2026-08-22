@@ -201,29 +201,22 @@ publishing submissions to My Channel (@my_rednote_channel)
 If the channel is unusable the bot still runs and answers submitters directly, so nothing is
 lost while you fix the permission.
 
-#### With a discussion group
+#### Long posts, and the link that leads to the rest
 
-Link a discussion group to the channel (**Edit → Discussion** in the Telegram app — there is no
-Bot API for it) and **add the bot to that group as an administrator**. The bot finds it from the
-channel's `linked_chat_id`; there is nothing to configure.
+A note that doesn't fit one message becomes several: the album first (split into `[1/n]` parts
+if it runs past Telegram's 10-item limit), then any description overflow, then the top comments
+— each replying to the one before, so the post threads properly in the channel.
 
-Telegram copies every channel post into the linked group, and a reply to that copy shows up as
-a comment on the post. So the bot puts everything that isn't the main event underneath:
+A reply chain is invisible once a post is forwarded out of the channel, though: the reader gets
+the first message and no way to reach the rest. So every message but the last also carries a
+`continues ↓` link to the next one's permalink. They are added by *editing* after the whole
+sequence is sent — message ids can't be predicted — and the caption reserves room for one up
+front.
 
-| | Channel post | Comments |
-|---|---|---|
-| First 10 media | ✓ | |
-| Caption | note text | |
-| Media 11+ | | ✓ marked `[2/2]` |
-| Description overflow | | ✓ |
-| Top comments | | ✓ always, even when they'd fit the caption |
-
-The channel stays a clean feed; the detail lives in the thread. The copy is asynchronous —
-measured at 6.5s in practice — so the bot waits for it (up to `Bot.THREAD_TIMEOUT`, 20s). If it
-never arrives the extras are chained onto the channel post instead, so nothing is lost.
-
-The bot only accepts submissions in direct messages. Anything said in the discussion group is
-ignored, so it never talks back to people commenting.
+Putting the extras into the channel's **linked discussion group** was tried first and reverted,
+for the same reason: a forwarded post loses its thread, so the reader can't reach them. The bot
+ignores linked discussion groups entirely, which is also why it never talks back to people
+commenting on a post.
 
 #### Collecting links from groups
 
@@ -297,7 +290,7 @@ Everything except the token has a working default.
 | `DEBUG_UPDATES` | `false` | Dumps every incoming update, message text included. Diagnostics only — a mistyped cookie would land in the log. |
 | `CHANNEL_ID` | unset | `@name` or `-100…`. Set it to run in channel mode — see below. |
 | `COMMENTS` | `5` | Top comments (with their replies) posted as a follow-up message. `0` disables the extra page fetch. |
-| `ACRES` | `true` | 1point3acres thread links, DM only. `false` turns the feature off entirely. |
+| `ACRES` | `true` | 1point3acres thread links, in DMs, watched groups and the channel alike. `false` turns the feature off entirely. |
 | `ACRES_UA` | unset | Fallback User-Agent for a stored 1point3acres cookie that arrived without one. |
 | `ACRES_COMMENTS` | `10` | Top replies attached to a thread, ranked by 好苗/杂草. `0` disables. Costs no extra request. |
 | `ACRES_TELEGRAPH` | `true` | Publish threads to telegra.ph and reply with the link. `false` sends chunked messages instead, as does a telegra.ph outage. |
@@ -490,9 +483,10 @@ runs it.
 uv run --python 3.12 --with 'httpx==0.28.1' --with pytest python -m pytest tests -q
 ```
 
-49 tests, no network and no Telegram required: link parsing, payload normalisation across both
-of the downloader's locales, caption budgeting against Telegram's UTF-16 limits, album
-chunking, the URL→upload fallback, and the pairing/allowlist/cookie paths.
+232 tests, no network, Telegram or sidecar required: link parsing, payload normalisation across
+both of the downloader's locales, caption budgeting against Telegram's UTF-16 limits, album
+chunking, the URL→upload fallback, the pairing/allowlist/cookie paths, channel mode, and the
+1point3acres path from jammer-stripping to the Telegraph page.
 
 ```
 bot/app/

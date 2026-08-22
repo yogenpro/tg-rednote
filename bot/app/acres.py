@@ -6,7 +6,8 @@ RedNote path:
 * **Cloudflare answers anonymous requests with a managed challenge**, so there
   is no cookieless mode at all. TLS impersonation is not enough — the challenge
   wants JavaScript — so the only way in is the owner's own browser cookie,
-  which is why this feature is DM-only and owner-provisioned. `cf_clearance` is
+  which is why this feature is owner-provisioned (delivery, since 2026-08-21,
+  runs the same three paths RedNote does). `cf_clearance` is
   bound to the User-Agent that solved the challenge, so the UA is stored
   alongside the cookie rather than hardcoded.
 

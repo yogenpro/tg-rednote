@@ -44,11 +44,22 @@ notes (images, Ultra-HDR albums, videos, forwarded messages, `.com` and `.cn` li
 - [ ] **Split routing is untested against a real proxy.** The plumbing is unit-tested and the
       sidecar's `proxy` field was verified live (a dead proxy fails the fetch), but no traffic
       has yet gone through an actual Tailscale exit node. Check both IPs differ once the home
-      machine is advertising itself as one.
+      machine is advertising itself as one. Two things to confirm on that first run, both
+      reasoned out rather than observed: that the container's healthcheck really does go green
+      once an exit node is in use (`"ExitNode": true` was verified as absent when none is set,
+      never as present when one is), and whether a userspace node inside a Docker bridge gets a
+      direct path home or settles for DERP.
 
 - [ ] **No way to unpublish.** The bot has `can_delete_messages` in both chats and
       `state.forget_published()` exists, but no command is wired up. Removing a post today means
       deleting it by hand *and* the note staying in the dedupe index.
+
+- [ ] **The sidecar has never started against an empty volume.** The deployment file gives it
+      a named `xhs-settings` volume rather than the repo's seeded `xhs-volume/`, so on a fresh
+      server it has to write its own `settings.json` — which is what it does on every start
+      anyway, and nothing the bot does reads that file (cookie and proxy travel per request).
+      Reasoned, not observed: no Docker daemon was reachable when the split was made. If it
+      turns out to need seeding, one `curl` into the volume fixes it.
 
 - [ ] **The container has never run with a real token.** The image was built and smoke-tested
       on a remote host (imports, config, healthcheck both ways, graceful failure on a bad and a

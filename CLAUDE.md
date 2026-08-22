@@ -183,6 +183,29 @@ and braces. Note what proxying 1point3acres implies: `cf_clearance` is commonly 
 IP that solved the challenge, so the exit should match the browser the `/acres` paste came
 from.
 
+**The compose `tailscale` profile joins the tailnet twice on purpose.** The deploy host
+already runs tailscaled, and reusing it was the first instinct; it cannot work. An exit node is
+a *per-device* setting, so the host's daemon can only send every process on the machine home —
+Telegram, uploads, unrelated containers — and takes the host offline entirely when home is
+down. There is no per-process form of it (app-based split tunnelling is Android-only).
+Tailscale's domain-scoped feature, app connectors, was rejected on its own documentation:
+their best-practices page says not to point one at a CDN, which is nearly every XHS byte, its
+discovered routes are never pruned as edge IPs rotate, and it fails *open* — an unlearned
+domain leaves from the server's IP unlogged, the opposite of what `PROXY` does. So the
+profile runs a second, userspace node: no TUN, no `NET_ADMIN`, no host routing changes, its own
+machine key and state, and on the Personal plan an untagged key costs nothing (user devices are
+unlimited). Two consequences: the console shows two rows for one machine (hence `TS_HOSTNAME`),
+and a direct path home may fall back to DERP.
+
+**The tailscale container's healthcheck asserts the exit node, not the daemon.** A node with no
+exit node serves its HTTP proxy perfectly and exits from the server's IP — the single failure
+the split exists to prevent, and one nothing downstream would notice. `"ExitNode": true` on a
+peer in `tailscale status --json` is the proof; the field is present and false on every peer
+when none is in use (checked against 1.102.3). Related: `--exit-node-allow-lan-access` was
+dropped from `TS_EXTRA_ARGS` because the CLI refuses it when the exit node is empty ("can only
+be used with --exit-node"), which failed the container at startup for anyone enabling the
+profile before setting `TS_EXIT_NODE`.
+
 **Telegram caps bot uploads at 50 MB** and XHS serves video well past it. The note page lists
 every rendition with a declared `size` (h264 full quality, h265 at roughly half the bytes), so
 `MediaSender._fetch_within_budget` retries with the largest one that fits. Sizes come from the
@@ -311,6 +334,17 @@ produces one baffling bug years later.
 `_gid=`, and the RedNote matcher accepts anything containing `gid=`, so the forum check runs
 first. `acres.looks_like_cookie` also refuses anything containing `://`: the cookie handler
 *deletes* the message it is given, and an `oss.1p3a.com` image URL would otherwise be eaten.
+
+**Two compose files, and the base one must stand alone.** `docker-compose.yml` is the whole
+deployment: published images, named volumes, not one path out of the repo — so a server installs
+it with two `curl`s and never sees the source. `docker-compose.override.yml` is what a checkout
+adds, and Compose merges it automatically when the two sit together: `build: ./bot` with
+`pull_policy: build` (without which an old `latest` on the machine silently stands in for your
+working tree), the seeded `./xhs-volume` bind mount, and `127.0.0.1:5556` for `tools/spike.py`.
+Mounts merge *by target*, verified with `docker compose config`, so the bind mount replaces the
+`xhs-settings` named volume rather than colliding with it. The trap to watch for: the override
+can keep a base file working that no longer stands on its own, so check a compose change with
+`docker compose -f docker-compose.yml config` — the deployment shape — not just the merged one.
 
 **CI is one workflow, `.github/workflows/ci.yml`, with two jobs.** `pytest` runs the suite on
 3.12 and 3.13 for every push and pull request — it needs no network, sidecar or Telegram, so a

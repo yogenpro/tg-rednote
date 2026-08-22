@@ -1,0 +1,27 @@
+# Development only. Compose loads this automatically when it sits next to
+# docker-compose.yml, so a checkout builds from source while a server running
+# the same base file pulls the published image and mounts nothing from disk.
+#
+#   docker compose up -d --build          # here: build ./bot, seeded settings
+#   docker compose -f docker-compose.yml up -d   # what a server does, exactly
+#
+# Nothing in here belongs in a deployment: everything it adds needs the repo.
+
+services:
+  xhs-downloader:
+    volumes:
+      # The seeded settings.json, and the sidecar's writes where you can read
+      # them. Replaces the named volume in the base file — Compose merges
+      # mounts by target, so this wins rather than colliding.
+      - ./xhs-volume:/app/Volume
+    # Reachable from the host so tools/spike.py --downloader can talk to it.
+    # Loopback only; the deployment publishes no port at all.
+    ports:
+      - "127.0.0.1:5556:5556"
+
+  bot:
+    build: ./bot
+    # Build rather than pull: without this, an image already on the machine
+    # (say a `latest` pulled last week) silently stands in for your working
+    # tree, and you debug code you did not write.
+    pull_policy: build

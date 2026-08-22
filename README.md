@@ -50,17 +50,25 @@ findable. Copy the token.
 There is no BotFather setting that restricts who can DM a bot. That's what the allowlist is
 for.
 
-**3. Configure and start.**
+**3. Configure and start.** Two files are the whole deployment — no checkout, no git, no
+source on the server:
 
 ```bash
-cp .env.example .env
+mkdir tg-rednote && cd tg-rednote
+curl -O https://raw.githubusercontent.com/yogenpro/tg-rednote/main/docker-compose.yml
+curl -o .env https://raw.githubusercontent.com/yogenpro/tg-rednote/main/.env.example
 $EDITOR .env          # set TG_BOT_TOKEN
-docker compose up -d --build
+docker compose up -d
 docker compose logs -f bot
 ```
 
-That builds the bot image and pulls the pinned XHS-Downloader sidecar. The bot waits for the
-sidecar to report healthy before it starts. Nothing is published on a host port.
+That pulls the published bot image (multi-arch, so a Raspberry Pi works) and the pinned
+XHS-Downloader sidecar. The bot waits for the sidecar to report healthy before it starts.
+Nothing is published on a host port, and nothing outside this directory is touched: state and
+the sidecar's settings live in named volumes.
+
+To work on the code instead of just running it, see [Development](#development) — a checkout
+adds `docker-compose.override.yml`, which Compose merges automatically to build from source.
 
 Both containers are `restart: unless-stopped` and cap their logs at 3×10 MB. The bot runs as
 an unprivileged user (uid 10001) and its only writable path is the `bot-state` volume.
@@ -374,21 +382,60 @@ docker compose --profile tailscale up -d
 ```
 
 The exit node has to be advertised (`tailscale up --advertise-exit-node` on the home machine)
-and approved in the admin console. The container runs in **userspace mode**: no `TUN` device,
-no `NET_ADMIN`, no changes to the host's routing table. Its only exposed surface is the HTTP
-proxy on the compose network, so nothing else on the machine can accidentally start using the
-tunnel.
+and approved in the admin console.
 
-Sanity checks once it's up:
+### Why a second node, when the server already runs tailscaled
+
+Most servers worth deploying this on are already on your tailnet, and the obvious move is to
+reuse that daemon. It cannot do this job. **An exit node is a per-device setting**: point the
+host's tailscaled at home and *everything* on that machine goes home — Telegram, media uploads,
+every other container you run there — and the host loses internet outright whenever the home
+box is offline. There is no per-process or per-container variant of it; app-based split
+tunnelling exists only on Android. Tailscale's own answer for domain-scoped routing is
+[app connectors](https://tailscale.com/kb/1281/app-connectors), and their
+[best practices](https://tailscale.com/docs/reference/best-practices/app-connectors) tell you
+not to point one at a CDN — which is what nearly every XHS byte comes from. It also fails
+*open*: a domain whose route hasn't been learned just leaves from the server's IP, unlogged.
+
+So the profile brings a node of its own, and the two daemons coexist without touching:
+
+- **Userspace mode** means no `TUN` device, no `NET_ADMIN`, no iptables rules and no entry in
+  the host's routing table. The container's tailscaled lives entirely inside its network
+  namespace, with its own machine key and its own state volume.
+- **The host's tailscaled needs no changes** — and specifically should *not* have an exit node
+  set. If it does, the split is already lost.
+- **It is free.** On the Personal plan user devices are unlimited, so an untagged auth key
+  costs nothing; a tagged one spends 1 of the 50 included tagged resources.
+- Its only exposed surface is the HTTP proxy on the compose network, so nothing else on the
+  machine can accidentally start using the tunnel.
+
+The two costs are worth knowing. The admin console gains a second row for one machine — hence
+`TS_HOSTNAME`, defaulting to `tg-rednote-xhs` rather than something that reads like the host —
+and `tailscale status` on the host will not show it; ask the container instead. And two nodes
+behind one NAT, one of them inside a Docker bridge, may not find a direct path home and fall
+back to a DERP relay. That is slower, not broken, and `tailscale status` names it.
+
+### Sanity checks once it's up
 
 ```bash
-docker compose exec tailscale tailscale status | head -3
+docker compose exec tailscale tailscale status | head -3   # 'direct' or 'relay' shows here
 docker compose exec tailscale tailscale ip -4
 # what a fetch would see:
 docker compose exec bot python -c "import httpx;print(httpx.get('https://api.ipify.org',proxy='http://tailscale:1055').text)"
 # and what Telegram sees, which should differ:
 docker compose exec bot python -c "import httpx;print(httpx.get('https://api.ipify.org',trust_env=False).text)"
 ```
+
+The container's healthcheck asserts the *exit node* is in use, not merely that the daemon is
+up: a node with no exit node serves the proxy just as happily and quietly exits from the
+server's own IP, which is the one failure this whole arrangement exists to prevent. So
+`docker compose ps` showing `xhs-tailscale` as healthy is itself the check that the split is
+live.
+
+One thing the proxy does not move: DNS. `TS_ACCEPT_DNS` is off, so tailscaled resolves XHS
+hostnames through the container's resolver — from the server's vantage point — and only the
+connection itself is made from home. XHS sees the home IP either way, which is what the walls
+key on; it may just pick a CDN edge near the server.
 
 `/status` shows the proxy when one is set. If the proxy dies, fetches fail while the bot stays
 up and answers — it does not silently fall back to the server's own IP.
@@ -398,8 +445,9 @@ up and answers — it does not silently fall back to the server's own IP.
 ## Verifying the two assumptions
 
 `tools/spike.py` answers the open questions in PLAN §10 against a real link. It's stdlib-only,
-so any Python 3.8+ runs it. Uncomment the `ports:` block for `xhs-downloader` in
-`docker-compose.yml` first.
+so any Python 3.8+ runs it, and it needs the sidecar reachable from the host — which a checkout
+already gives you, since `docker-compose.override.yml` publishes it on `127.0.0.1:5556`. A
+deployment publishes no port, so run the spike from a checkout.
 
 ```bash
 # §9.1 — does a cookieless fetch work for a freshly-shared link?
@@ -473,15 +521,17 @@ The tag is pinned deliberately — the API surface moved between releases (`main
 config, the event vocabulary and the queries worth keeping. Cookie values are never logged, including in
 tracebacks, and message text is only logged with `DEBUG_UPDATES=true`.
 
-**Prebuilt image.** Every push to `main` whose tests pass publishes a multi-arch image (amd64 and arm64, so a
-Raspberry Pi works) to the GitHub Container Registry:
+**Upgrading the bot.** Every push to `main` whose tests pass publishes a multi-arch image
+(amd64 and arm64) to the GitHub Container Registry, which is what a deployment runs:
 
 ```bash
-docker compose pull bot && docker compose up -d    # skips the local build
+docker compose pull bot && docker compose up -d
 ```
 
 Tags: `latest` tracks `main`, `sha-<commit>` pins an exact build, and `vX.Y.Z` appears when a
-release is tagged.
+release is tagged. To pin, set the tag in `docker-compose.yml` — the package is public, so no
+`docker login` is needed either way. (In a checkout the override builds `./bot` locally
+instead, and `pull bot` will not displace it.)
 
 **Running without Compose.** The image carries working defaults, so it needs only a token and
 somewhere to reach the sidecar:
@@ -492,10 +542,10 @@ docker run -d --name xhs-bot --restart unless-stopped \
   -v xhs-bot-state:/data ghcr.io/yogenpro/tg-rednote:latest
 ```
 
-**Building against a remote Docker host** (`docker --context …`) works, but the `./xhs-volume`
-bind mount resolves on the *remote* machine, so the sidecar there won't see the seeded
-`settings.json`. Fine for a build check; for a real deployment, put the repo on the machine that
-runs it.
+**Building against a remote Docker host** (`docker --context …`) works, but bind mounts resolve
+on the *remote* machine, so the checkout's `./xhs-volume` and `./bot` are not the ones you are
+editing. Fine for a build check; to actually deploy to that machine, use the two-file install
+above rather than pushing a checkout at it.
 
 ---
 
@@ -508,21 +558,49 @@ runs it.
 | `TG_BOT_TOKEN is required` on repeat | `.env` isn't being read. It must sit next to `docker-compose.yml`; the container restarts until it is. |
 | Every fetch fails, `/status` says stale | Cookie expired, or XHS is rate-limiting this IP. Re-extract the cookie; if that doesn't help, wait it out. |
 | Fetches fail from the very first try | Usually a datacenter IP. See the first section. |
-| `downloader: ⚠️ unreachable` | `docker compose logs xhs-downloader` — most often a bad `settings.json` in `xhs-volume/`. |
+| `downloader: ⚠️ unreachable` | `docker compose logs xhs-downloader` — most often a bad `settings.json`. A deployment keeps it in the `xhs-settings` volume; `docker compose down && docker volume rm <project>_xhs-settings` gets a fresh one. A checkout keeps it in `xhs-volume/`. |
+| `docker compose up` tries to build, on a server | The `docker-compose.override.yml` from a checkout is sitting next to the compose file. It is a development file; a deployment wants only `docker-compose.yml`. |
 | Some album items missing | They exceeded `MAX_UPLOAD_BYTES` while streaming through; the bot says which. |
 
 ---
 
 ## Development
 
+Everything above describes running the bot. This is for changing it, and it is the only part
+that wants a checkout:
+
+```bash
+git clone https://github.com/yogenpro/tg-rednote && cd tg-rednote
+cp .env.example .env && $EDITOR .env
+docker compose up -d --build
+```
+
+**Two compose files, and Compose merges them for you.** `docker-compose.yml` is the deployment
+— published images, named volumes, nothing from the repo. `docker-compose.override.yml` is
+picked up automatically whenever it is next to it, and is what makes a checkout different:
+
+| | Deployment (`docker-compose.yml`) | Checkout (+ override) |
+|---|---|---|
+| bot image | pulled from ghcr.io | built from `./bot`, `pull_policy: build` |
+| sidecar settings | `xhs-settings` named volume | bind-mounted `./xhs-volume`, seeded |
+| sidecar port | not published | `127.0.0.1:5556`, for `tools/spike.py` |
+
+So `docker compose up -d --build` here builds your working tree, and
+`docker compose -f docker-compose.yml up -d` runs exactly what a server runs — worth doing
+before shipping a compose change, since the override can hide a base file that no longer
+stands on its own.
+
+**Tests** need neither Docker nor the network:
+
 ```bash
 uv run --python 3.12 --with 'httpx==0.28.1' --with pytest python -m pytest tests -q
 ```
 
-244 tests, no network, Telegram or sidecar required: link parsing, payload normalisation across
+249 tests, no network, Telegram or sidecar required: link parsing, payload normalisation across
 both of the downloader's locales, caption budgeting against Telegram's UTF-16 limits, album
 chunking, the URL→upload fallback, the pairing/allowlist/cookie paths, channel mode and the
-per-user DM setting, and the 1point3acres path from jammer-stripping to the Telegraph page.
+per-user DM setting, which traffic takes the proxy and which is pinned direct, and the
+1point3acres path from jammer-stripping to the Telegraph page.
 
 ```
 bot/app/

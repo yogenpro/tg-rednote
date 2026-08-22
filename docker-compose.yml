@@ -2,9 +2,29 @@
 # Nothing here listens on the host: the bot long-polls Telegram outbound and
 # talks to the sidecar over the compose network.
 #
-#   cp .env.example .env   # put your BotFather token in it
+# This file is the whole deployment. It runs published images and mounts no
+# path from the repo, so a server needs this file and a .env beside it — no
+# checkout, no git, no source:
+#
+#   curl -O https://raw.githubusercontent.com/yogenpro/tg-rednote/main/docker-compose.yml
+#   curl -o .env https://raw.githubusercontent.com/yogenpro/tg-rednote/main/.env.example
+#   $EDITOR .env           # put your BotFather token in it
 #   docker compose up -d
 #   docker compose logs -f bot
+#
+# In a checkout, docker-compose.override.yml sits next to this one and Compose
+# merges it automatically: that is what adds the local build and the bind
+# mounts. `docker compose -f docker-compose.yml up -d` ignores it and runs
+# exactly what a server would.
+#
+# Deploying on a server that already runs tailscaled is the expected case, and
+# this file assumes it: the `tailscale` profile below adds a *second*, userspace
+# node rather than borrowing the host's. That is not duplication for its own
+# sake — an exit node is a per-device setting, so a host daemon can only send
+# every process on the machine home, Telegram and all. A node of its own is what
+# lets XHS traffic go home while everything else keeps the server's link. The
+# host's tailscaled needs no changes, and specifically should not have an exit
+# node set.
 
 services:
   # Optional: send the traffic that fetches out through a machine on your
@@ -12,6 +32,13 @@ services:
   # telegra.ph — keeps using this host's own connection. Enable with
   # `docker compose --profile tailscale up -d` and set
   # PROXY=http://tailscale:1055 in .env. See the README.
+  #
+  # This is a tailnet node in its own right, separate from any tailscaled on the
+  # host. The two never meet: userspace mode means no TUN device, no NET_ADMIN,
+  # no iptables rules and no entry in the host's routing table, so this one lives
+  # entirely inside its network namespace with its own machine key and state.
+  # On the free plan an untagged auth key makes it a user device, which is
+  # unlimited; a tagged one spends 1 of the 50 included tagged resources.
   tailscale:
     image: tailscale/tailscale:stable
     container_name: xhs-tailscale
@@ -20,18 +47,35 @@ services:
     environment:
       # Both come from .env; the profile is useless without them.
       TS_AUTHKEY: ${TS_AUTHKEY:-}
-      TS_HOSTNAME: ${TS_HOSTNAME:-tg-rednote}
+      # Give it a name the admin console can tell apart from the host's own
+      # node — they are two rows on one machine, and `tailscale status` run on
+      # the host will not show this one.
+      TS_HOSTNAME: ${TS_HOSTNAME:-tg-rednote-xhs}
       # Userspace mode: no TUN device, no NET_ADMIN, no host routing changes.
       # tailscaled's own HTTP proxy is the only way in, which is exactly the
       # narrow door we want.
       TS_USERSPACE: "true"
       TS_STATE_DIR: /var/lib/tailscale
-      TS_EXTRA_ARGS: --exit-node=${TS_EXIT_NODE:-} --exit-node-allow-lan-access
+      # No --exit-node-allow-lan-access: the CLI refuses it outright when the
+      # exit node is empty ("can only be used with --exit-node"), so an unset
+      # TS_EXIT_NODE would fail the container at startup, and the only traffic
+      # this node carries is XHS on the public internet anyway.
+      TS_EXTRA_ARGS: --exit-node=${TS_EXIT_NODE:-}
       TS_TAILSCALED_EXTRA_ARGS: --outbound-http-proxy-listen=0.0.0.0:1055
     volumes:
       - tailscale-state:/var/lib/tailscale
     healthcheck:
-      test: ["CMD-SHELL", "tailscale status --peers=false >/dev/null 2>&1 || exit 1"]
+      # Not "is the daemon up" — a node with no exit node serves the proxy just
+      # as happily and quietly exits from this server's IP, which is the one
+      # failure the whole split exists to prevent. A peer carrying our traffic
+      # is the only proof, and it reads `"ExitNode": true` in the status JSON
+      # (verified against 1.102.3; the field is present and false on every peer
+      # when no exit node is in use).
+      test:
+        - CMD-SHELL
+        - >-
+          tailscale status --json 2>/dev/null
+          | grep -q '"ExitNode": true' || exit 1
       interval: 30s
       timeout: 10s
       retries: 3
@@ -49,11 +93,12 @@ services:
     command: ["python", "main.py", "api"]
     restart: unless-stopped
     volumes:
-      # settings.json lives here; the container writes back to it on start.
-      - ./xhs-volume:/app/Volume
-    # Uncomment to poke the API from the host (tools/spike.py --downloader).
-    # ports:
-    #   - "127.0.0.1:5556:5556"
+      # settings.json lives here and the container writes back to it on start.
+      # A named volume rather than a path from the repo, so this file stands on
+      # its own; the checkout's override swaps in ./xhs-volume. Nothing the bot
+      # does reads it either way — the cookie and the proxy travel in each
+      # request (see CLAUDE.md), so an empty volume on first start is fine.
+      - xhs-settings:/app/Volume
     healthcheck:
       # A plain TCP connect: the root path 307s off to GitHub, which would make
       # the healthcheck depend on outbound internet rather than the sidecar.
@@ -69,9 +114,9 @@ services:
     logging: *logging
 
   bot:
-    # Built locally by default. To use the published image instead and skip the
-    # build, run `docker compose pull bot` first — same tag either way.
-    build: ./bot
+    # Published multi-arch image; `docker compose up -d` pulls it. The checkout's
+    # override replaces this with a local build of ./bot. `latest` tracks main —
+    # `sha-<commit>` or `vX.Y.Z` pin an exact build.
     image: ghcr.io/yogenpro/tg-rednote:latest
     container_name: xhs-bot
     restart: unless-stopped
@@ -101,3 +146,4 @@ services:
 volumes:
   bot-state:
   tailscale-state:
+  xhs-settings:

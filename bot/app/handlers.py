@@ -844,11 +844,9 @@ class Bot:
         if overflow:
             trailing = thread.comments
         else:
-            with_replies = fit_into_caption(
+            head, trailing = fit_into_caption(
                 head, thread.comments, limit=limit - marker, like=ACRES_LIKE
             )
-            trailing = [] if with_replies != head else thread.comments
-            head = with_replies
 
         first: int | None = None
         previous: int | None = None
@@ -1321,9 +1319,7 @@ class Bot:
         if overflow:
             trailing = comments
         else:
-            with_comments = fit_into_caption(caption, comments, limit=budget)
-            trailing = [] if with_comments != caption else comments
-            caption = with_comments
+            caption, trailing = fit_into_caption(caption, comments, limit=budget)
 
         # Where the album goes: the channel if we're curating one, else back to
         # whoever asked. A channel post can't reply to a user's message.

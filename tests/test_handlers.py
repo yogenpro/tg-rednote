@@ -593,6 +593,48 @@ async def test_comments_get_their_own_message_when_the_caption_is_full(tmp_path)
 
 
 @pytest.mark.asyncio
+async def test_a_comment_too_long_for_the_caption_is_not_cut_and_dropped(tmp_path):
+    """The caption had *some* room, which used to be worse than none.
+
+    With no room at all the comments were moved to a follow-up. With a little,
+    the first one was truncated into the caption with an ellipsis and the rest
+    thrown away — and the caller could not tell that apart from "they all
+    fitted", so nothing followed. The reader saw a sentence stop mid-word with
+    no second message behind it. Seen live on /gradient_canopy/173.
+    """
+    from app.comments import Comment
+
+    note = Note(
+        note_id="650a",
+        kind="image",
+        title="T" * 40,
+        desc="D" * 860,  # fits the caption, leaving ~90 units — room for part of a comment
+        author="Someone",
+        url="https://www.xiaohongshu.com/explore/650a",
+        photos=["https://cdn/1"],
+        lives=[None],
+    )
+    body = ("本 " * 130).strip()  # far more than the caption's leftover room
+    comments = [Comment("u1", body, likes="3"), Comment("u2", "second", likes="1")]
+    bot, telegram, _ = make_bot(
+        tmp_path, downloader=FakeDownloader(note, comments=comments), owner=1
+    )
+    await bot.handle_update(message("http://xhslink.com/o/x"))
+
+    caption = bot.sender.sends[0][2]
+    follow_ups = " || ".join(text for _chat, text in telegram.sent)
+    # The note's own text still has the caption, whole.
+    assert "D" * 860 in _visible(caption)
+    # Nothing of the thread was cut into it…
+    assert "top comments" not in caption
+    assert "…" not in _visible(caption)
+    # …and all of it, both comments, arrived behind the album.
+    assert "top comments" in follow_ups
+    assert body in _visible(follow_ups)
+    assert "second" in follow_ups
+
+
+@pytest.mark.asyncio
 async def test_a_failed_comment_scrape_still_delivers_the_note(tmp_path):
     class Exploding(FakeDownloader):
         async def enrich(self, note, limit=5):

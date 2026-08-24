@@ -80,6 +80,17 @@ just a token or a timestamp (`ci.xiaohongshu.com/<token>`, `sns-webpic-qc.xhscdn
 mixes families, only the item Telegram names in `failed to send message #N` is blamed: a single
 Ultra-HDR image otherwise condemns the ordinary family it travelled with.
 
+**Streaming a family through is not a fix for every item in it.** A 16-image album live on
+2026-08-23 (`6a8a819e0000000014029fce`) had one image fail as a URL (`WEBPAGE_CURL_FAILED`,
+family streamed through), then fail *again* once uploaded — this time `PHOTO_INVALID_DIMENSIONS`,
+which is the actual bytes, not the fetch, and streaming can never fix it. The old code treated
+"nothing fresh to blame" as "raise", which lost all 16 images to one bad photo. `send` now tells
+apart a culprit index that isn't in the current URL-mode set because it's *out of range* (don't
+trust the pointer, blame every URL-mode family, unchanged) from one that's in range but already
+upload-mode (nothing fresh — the retry already happened and failed again): only the second case
+drops just that item from the group and keeps going. `report.skipped` picks it up same as an
+oversized video, so the caller's existing "Skipped: …" reply needed no changes.
+
 **XHS has three wall shapes, and two of them answer HTTP 200.** `/website-login/error?redirectPath=…`
 is the login wall; `/404/sec_<token>?source=xhs_sec_server&originalUrl=…` is its bot check, and
 rednote.com spells the same check `/404?source=/404/sec_<token>?redirectPath=…` — note the

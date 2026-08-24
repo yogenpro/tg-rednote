@@ -597,6 +597,56 @@ async def test_auto_mode_falls_back_on_any_400(description, monkeypatch):
     assert sender.streaming is True
 
 
+class BadDimensionsTelegram:
+    """Item 2 fails as a URL, then fails again as an upload — real bad bytes,
+    not a fetch problem. Seen live as PHOTO_INVALID_DIMENSIONS on an XHS
+    panorama; streaming through never fixes it because the image itself is
+    the problem."""
+
+    def __init__(self):
+        self.calls = []
+        self.next_id = 0
+
+    async def call(self, method, payload=None, files=None, timeout=None, retries=3):
+        self.calls.append((method, payload, sorted((files or {}).keys())))
+        media = payload.get("media", [])
+        second = media[1]["media"] if len(media) > 1 else None
+        if second == "https://cdn/1":
+            raise TelegramError(
+                method, 400, 'Bad Request: failed to send message #2 with the error message "WEBPAGE_CURL_FAILED"'
+            )
+        if second == "attach://file1":
+            raise TelegramError(
+                method, 400, 'Bad Request: failed to send message #2 with the error message "PHOTO_INVALID_DIMENSIONS"'
+            )
+        sent = media or [payload.get("photo") or payload.get("video")]
+        result = []
+        for i in range(len(sent)):
+            self.next_id += 1
+            result.append({"message_id": self.next_id, "photo": [{"file_id": f"fid{i}"}]})
+        return result if method == "sendMediaGroup" else result[0]
+
+
+@pytest.mark.asyncio
+async def test_auto_mode_drops_item_that_fails_even_after_streaming(monkeypatch):
+    telegram = BadDimensionsTelegram()
+    sender = MediaSender(telegram, mode="auto")
+
+    async def fake_download(url):
+        return b"bytes", "image/jpeg", url
+
+    monkeypatch.setattr(sender, "_download", fake_download)
+    items = [MediaItem("photo", f"https://cdn/{i}") for i in range(2)]
+    report = await sender.send(1, items, "cap")
+    await sender.aclose()
+
+    # Item 0 still goes out; item 1 is dropped instead of sinking the album.
+    assert report.sent == 1
+    assert len(report.skipped) == 1
+    assert "item 2" in report.skipped[0]
+    assert "PHOTO_INVALID_DIMENSIONS" in report.skipped[0]
+
+
 @pytest.mark.asyncio
 async def test_pinned_url_mode_does_not_fall_back():
     telegram = FakeTelegram(fail_urls=True)

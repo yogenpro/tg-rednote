@@ -395,8 +395,19 @@ class MediaSender:
                         if str(entry.get("media", "")).startswith("http")
                     ]
                     culprit = exc.failed_index
-                    named = [family for index, family in by_url if index == culprit]
-                    families = set(named) if named else {family for _i, family in by_url}
+                    in_range = culprit is not None and culprit <= len(sources)
+                    # A culprit outside the range we sent isn't trustworthy as a
+                    # pointer (Telegram's numbering has been seen not to line up
+                    # 1:1) — blame everything URL-mode, same as no culprit at
+                    # all. But a culprit *inside* the range that isn't in by_url
+                    # is already upload-mode (its family was refused on a
+                    # previous pass through this loop): there is nothing fresh
+                    # to blame, and falling back to "blame everything" here
+                    # would condemn unrelated families Telegram never named.
+                    if culprit is None or not in_range:
+                        families = {family for _i, family in by_url}
+                    else:
+                        families = {family for index, family in by_url if index == culprit}
                     fresh = families - self._refused
                     if self._configured_mode == "auto" and exc.error_code == 400 and fresh:
                         log.warning(
@@ -412,6 +423,23 @@ class MediaSender:
                             ),
                         )
                         self._refused |= families
+                        continue
+                    # Streaming didn't fix it either (or there was nothing left
+                    # to try streaming): the bytes themselves are the problem —
+                    # an XHS panorama landing on PHOTO_INVALID_DIMENSIONS is what
+                    # was seen live — not the fetch. Drop just the named item and
+                    # keep the rest of the album moving rather than losing all of
+                    # it to one photo.
+                    if self._configured_mode == "auto" and exc.error_code == 400 and in_range:
+                        bad_index = sources[culprit - 1]
+                        report.skipped.append(f"item {bad_index + 1} rejected by Telegram ({exc.description})")
+                        log.warning(
+                            "Telegram rejected item %d (%s); dropping it and continuing",
+                            bad_index + 1,
+                            exc.description,
+                            extra=fields(event="item_rejected", reason=exc.description[:120]),
+                        )
+                        del group[bad_index]
                         continue
                     raise
                 self._remember(result, group, sources)

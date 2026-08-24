@@ -136,6 +136,18 @@ overflows at all, comments move to the follow-up message entirely (and ride insi
 text chunk, so an overflowing note costs two messages, not three). An earlier version reserved
 caption room for comments up front and pushed descriptions into a second message needlessly.
 
+**Comments in the caption are all or none, and that is the fix for a real silent loss.**
+`fit_into_caption` returns `(caption, leftover)`; it used to return just the caption, appending
+whatever fitted and truncating the first comment mid-sentence to do it. The caller could only
+compare the caption it got back against the one it passed in, so a half-rendered comment read
+as "they all got in" and `trailing` became `[]` — the remainder, and every later comment, went
+nowhere at all. The reader saw a sentence stop mid-word with nothing behind it
+(`/gradient_canopy/173`, 2026-08-22: one photo, one comment, no second message). Note the shape
+of it: *no* room was handled correctly and a *little* room was not, so the bug needed a caption
+with a small remainder to appear. `render_comments` still truncates, but only for the follow-up
+message, which has no third message to spill into. Both call sites — notes and 1point3acres —
+had the same line and both are fixed.
+
 **Chat actions expire after ~5s.** A video can take a minute, so `Bot._busy()` refreshes the
 action every 4s for the life of the job. Without it the chat looks dead and people re-send.
 

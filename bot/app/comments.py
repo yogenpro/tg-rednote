@@ -136,66 +136,92 @@ def _render_one(comment: Comment, *, reply: bool, like: str = "♥") -> str:
     return f"{head}\n{escape(comment.text)}"
 
 
-def render_comments(comments: list[Comment], *, limit: int, like: str = "♥") -> str:
-    """Render as much of the comment thread as fits in `limit` UTF-16 units.
+HEADER = "— top comments —"
 
-    Whole comments are dropped from the end rather than cut mid-sentence; a
-    comment's replies go with it. An over-long single comment is truncated so
-    that at least the top one always makes it in.
+
+def _pack(
+    comments: list[Comment], *, limit: int, like: str
+) -> tuple[list[str], int, int]:
+    """Whole comments that fit in `limit`, what they cost, and where it stopped.
+
+    Split out of `render_comments` so a caller can tell "they all fitted" from
+    "some of them did" — which is exactly what `fit_into_caption` could not do,
+    and the reason a truncated comment used to be the end of the thread.
     """
-    if not comments or limit <= 0:
-        return ""
-
-    header = "— top comments —"
     blocks: list[str] = []
-    used = tg_len(header)
-
+    used = tg_len(HEADER)
     for index, comment in enumerate(comments):
         rendered = [_render_one(comment, reply=False, like=like)]
         for child in comment.replies:
             rendered.append(_render_one(child, reply=True, like=like))
         block = "\n".join(rendered)
         cost = tg_len(_visible(block)) + 2  # separated by a blank line
-
         if used + cost > limit:
-            if index == 0:  # keep something rather than nothing
-                skeleton = Comment(
-                    comment.author, "", comment.likes, comment.location, comment.replying_to
-                )
-                fixed = tg_len(_visible(_render_one(skeleton, reply=False, like=like))) + 2
-                room = limit - used - fixed - 1  # the ellipsis costs one
-                if room < 20:
-                    return ""
-                head, _rest = tg_truncate(comment.text, room)
-                if not head:
-                    return ""
-                shortened = Comment(
-                    comment.author, f"{head}…", comment.likes, comment.location,
-                    comment.replying_to,
-                )
-                blocks.append(_render_one(shortened, reply=False, like=like))
-            break
+            return blocks, used, index
         blocks.append(block)
         used += cost
+    return blocks, used, len(comments)
+
+
+def render_comments(comments: list[Comment], *, limit: int, like: str = "♥") -> str:
+    """Render as much of the comment thread as fits in `limit` UTF-16 units.
+
+    Whole comments are dropped from the end rather than cut mid-sentence; a
+    comment's replies go with it. An over-long single comment is truncated so
+    that at least the top one always makes it in.
+
+    That truncation is a last resort and belongs to the follow-up message,
+    which has no third message behind it to spill into. The caption has one —
+    see `fit_into_caption`, which never cuts a comment.
+    """
+    if not comments or limit <= 0:
+        return ""
+
+    blocks, used, stopped = _pack(comments, limit=limit, like=like)
+    if stopped == 0:  # not even the first one fits: keep something rather than nothing
+        first = comments[0]
+        skeleton = Comment(first.author, "", first.likes, first.location, first.replying_to)
+        fixed = tg_len(_visible(_render_one(skeleton, reply=False, like=like))) + 2
+        room = limit - used - fixed - 1  # the ellipsis costs one
+        if room < 20:
+            return ""
+        head, _rest = tg_truncate(first.text, room)
+        if not head:
+            return ""
+        shortened = Comment(
+            first.author, f"{head}…", first.likes, first.location, first.replying_to,
+        )
+        blocks = [_render_one(shortened, reply=False, like=like)]
 
     if not blocks:
         return ""
-    return header + "\n\n" + "\n\n".join(blocks)
+    return HEADER + "\n\n" + "\n\n".join(blocks)
 
 
 def fit_into_caption(
     caption_html: str, comments: list[Comment], *, limit: int, like: str = "♥"
-) -> str:
-    """Append what fits of the comment thread to a caption, or return it unchanged.
+) -> tuple[str, list[Comment]]:
+    """Append the comment thread to a caption, or hand it back for the follow-up.
 
-    Comments ride in the caption so a forwarded album carries them along; they
-    take whatever room the note text left behind.
+    Returns the caption and whatever did not go into it. All of them or none of
+    them, which is the rule the note's own text already follows: a thread split
+    across two messages would repeat its header and read as two threads.
+
+    It used to append whatever fitted, truncating the first comment
+    mid-sentence to do it, and return only the caption — so the caller, which
+    could only compare the caption it got back against the one it passed in,
+    read a half-rendered comment as "they all got in" and sent no follow-up at
+    all. What the reader saw was a comment ending in an ellipsis with nothing
+    behind it, and any later comment gone without trace. Seen live on
+    /gradient_canopy/173.
     """
     if not comments:
-        return caption_html
+        return caption_html, []
     room = limit - tg_len(_visible(caption_html)) - 2
-    block = render_comments(comments, limit=room, like=like)
-    return f"{caption_html}\n\n{block}" if block else caption_html
+    blocks, _used, stopped = _pack(comments, limit=room, like=like)
+    if stopped < len(comments):
+        return caption_html, list(comments)
+    return f"{caption_html}\n\n" + HEADER + "\n\n" + "\n\n".join(blocks), []
 
 
 def strip_tags(html: str) -> str:

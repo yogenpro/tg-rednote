@@ -206,28 +206,36 @@ and braces. Note what proxying 1point3acres implies: `cf_clearance` is commonly 
 IP that solved the challenge, so the exit should match the browser the `/acres` paste came
 from.
 
-**The compose `tailscale` profile joins the tailnet twice on purpose.** The deploy host
-already runs tailscaled, and reusing it was the first instinct; it cannot work. An exit node is
-a *per-device* setting, so the host's daemon can only send every process on the machine home —
-Telegram, uploads, unrelated containers — and takes the host offline entirely when home is
-down. There is no per-process form of it (app-based split tunnelling is Android-only).
-Tailscale's domain-scoped feature, app connectors, was rejected on its own documentation:
-their best-practices page says not to point one at a CDN, which is nearly every XHS byte, its
-discovered routes are never pruned as edge IPs rotate, and it fails *open* — an unlearned
-domain leaves from the server's IP unlogged, the opposite of what `PROXY` does. So the
-profile runs a second, userspace node: no TUN, no `NET_ADMIN`, no host routing changes, its own
-machine key and state, and on the Personal plan an untagged key costs nothing (user devices are
-unlimited). Two consequences: the console shows two rows for one machine (hence `TS_HOSTNAME`),
-and a direct path home may fall back to DERP.
+**The fetching proxy is a plain HTTP proxy on a home box, not an exit node.** An earlier
+design ran a second, userspace tailnet node in compose with `TS_EXIT_NODE` — swapped out on
+2026-08-23 before it ever carried live traffic. The reasons that design existed still stand
+and still rule out the obvious alternative: an exit node is a *per-device* setting, so the
+host's daemon can only send every process on the machine home — Telegram, uploads, unrelated
+containers — and takes the host offline entirely when home is down; there is no per-process
+form of it (app-based split tunnelling is Android-only), and app connectors were rejected on
+their own documentation (don't point one at a CDN; discovered routes never pruned; fails
+*open*). A forward proxy on the home machine's tailnet IP answers all of it at once:
+`PROXY=http://100.x.y.z:8888` — tinyproxy with `Allow 100.64.0.0/10` — reached by both
+containers through the host's existing tailscaled route, egressing from home by construction.
+What the swap deleted: the whole compose service and its state volume, the auth key that
+would one day expire and silently kill the proxy on restart, the second console row, and the
+class of failure the healthcheck existed to catch — a node serving the proxy while exiting
+from the server's IP cannot happen when the proxy *is* the machine it exits from. Two things
+that are new rather than settled: containers reaching a tailnet IP via host forwarding is
+the one untested assumption (smoke-test it from inside both containers on first run), and
+DNS now resolves on the home box — an HTTP proxy is sent the hostname — so CDN edges are
+picked near home, which is what a home browser would see.
 
-**The tailscale container's healthcheck asserts the exit node, not the daemon.** A node with no
-exit node serves its HTTP proxy perfectly and exits from the server's IP — the single failure
-the split exists to prevent, and one nothing downstream would notice. `"ExitNode": true` on a
-peer in `tailscale status --json` is the proof; the field is present and false on every peer
-when none is in use (checked against 1.102.3). Related: `--exit-node-allow-lan-access` was
-dropped from `TS_EXTRA_ARGS` because the CLI refuses it when the exit node is empty ("can only
-be used with --exit-node"), which failed the container at startup for anyone enabling the
-profile before setting `TS_EXIT_NODE`.
+**The egress proof is one log line at startup (`proxy_egress`).** The removed tailscale
+container's healthcheck grepped `"ExitNode": true` in its status JSON because a userspace
+node without an exit node serves its HTTP proxy perfectly and exits from the server's IP —
+the single failure the split exists to prevent, and one nothing downstream would notice.
+With a plain proxy that state is gone by construction, but a `PROXY` pointed at the wrong box
+would still be silent, so `main.probe_egress` makes one best-effort fetch (`api.ipify.org`)
+through the proxy at boot and logs the IP it came back on — or the exception *type*, never
+the message, since a proxy URL can carry BasicAuth credentials and connect errors quote the
+address they failed on. It never blocks startup: the proxy may simply not be up yet, and
+failed fetches will say so again on their own.
 
 **Telegram caps bot uploads at 50 MB** and XHS serves video well past it. The note page lists
 every rendition with a declared `size` (h264 full quality, h265 at roughly half the bytes), so

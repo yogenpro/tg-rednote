@@ -380,8 +380,9 @@ can keep a base file working that no longer stands on its own, so check a compos
 **CI is one workflow, `.github/workflows/ci.yml`, with two jobs.** `pytest` runs the suite on
 3.12 and 3.13 for every push and pull request — it needs no network, sidecar or Telegram, so a
 red run is a real failure, never flake. `image` *needs* it, builds `bot/` for amd64 and arm64
-(QEMU) and pushes to `ghcr.io/yogenpro/tg-rednote`: `latest` tracks main, `sha-<commit>` pins a
-build, `vX.Y.Z` appears on a release tag. It skips pull requests. The two were separate
+(QEMU) and pushes to `ghcr.io/yogenpro/tg-rednote`: `latest` and the branch tag `main` track
+main, `vX.Y.Z` appears on a release tag, and an exact build is pinned by digest
+(`@sha256:…`) — there is no per-commit tag. It skips pull requests. The two were separate
 workflows first; `needs:` inside one workflow is what gates the push on the tests, and a
 `workflow_run` chain was rejected because it re-queues the build and arrives without the tag
 ref that names the image. The package is public, so `docker pull` needs no login. Actions are

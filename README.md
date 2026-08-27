@@ -529,8 +529,9 @@ tracebacks, and message text is only logged with `DEBUG_UPDATES=true`.
 docker compose pull bot && docker compose up -d
 ```
 
-Tags: `latest` tracks `main`, `sha-<commit>` pins an exact build, and `vX.Y.Z` appears when a
-release is tagged. To pin, set the tag in `docker-compose.yml` — the package is public, so no
+Tags: `latest` and `main` track the default branch, `vX.Y.Z` appears when a release is
+tagged, and an exact build is pinned by digest (`@sha256:…`) — there is no per-commit tag.
+To pin, set the tag in `docker-compose.yml` — the package is public, so no
 `docker login` is needed either way. (In a checkout the override builds `./bot` locally
 instead, and `pull bot` will not displace it.)
 

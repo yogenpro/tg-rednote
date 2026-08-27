@@ -57,8 +57,9 @@ services:
 
   bot:
     # Published multi-arch image; `docker compose up -d` pulls it. The checkout's
-    # override replaces this with a local build of ./bot. `latest` tracks main —
-    # `sha-<commit>` or `vX.Y.Z` pin an exact build.
+    # override replaces this with a local build of ./bot. `latest` and `main` track
+    # main — pin an exact build by digest (`@sha256:…`) or use a `vX.Y.Z` release
+    # tag; there is no per-commit tag.
     image: ghcr.io/yogenpro/tg-rednote:latest
     container_name: xhs-bot
     restart: unless-stopped

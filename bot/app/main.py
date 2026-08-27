@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import httpx
 import logging
 import os
 import signal
@@ -41,6 +42,45 @@ def export_proxy(config: Config) -> None:
     if host:
         local.add(host)
     os.environ.setdefault("NO_PROXY", ",".join(sorted(local)))
+
+
+# The startup egress probe asks this; any body that is just an IP works.
+EGRESS_URL = "https://api.ipify.org"
+
+
+async def _egress_ip(proxy: str) -> str:
+    """The public IP a request through `proxy` appears to come from."""
+    async with httpx.AsyncClient(proxy=proxy, timeout=10.0, follow_redirects=True) as client:
+        response = await client.get(EGRESS_URL)
+        response.raise_for_status()
+        return response.text.strip()
+
+
+async def probe_egress(proxy: str) -> None:
+    """Name, in one best-effort log line, where proxied fetching exits from.
+
+    The tailscale profile this design replaced asserted `"ExitNode": true` in
+    a container healthcheck because its node could serve the proxy while
+    quietly exiting from this server's own IP. A plain proxy cannot do that —
+    it egresses from wherever it runs, or refuses the connection — but a
+    `PROXY` pointed at the wrong box would still be silent, and one fetch
+    naming the IP settles the question (`event=proxy_egress`). Failure is a
+    warning, never a boot blocker: a proxy that is merely not up yet must not
+    stop the bot from starting, and fetches will say so again on their own.
+    Only the exception *type* is logged — a proxy URL can carry BasicAuth
+    credentials, and connect errors quote the address they failed on.
+    """
+    if not proxy:
+        return
+    try:
+        ip = await _egress_ip(proxy)
+    except Exception as exc:  # best-effort by contract; the poller starts either way
+        log.warning(
+            "could not probe the proxy: %s", type(exc).__name__,
+            extra=fields(event="proxy_egress", error=type(exc).__name__),
+        )
+        return
+    log.info("fetching exits via %s", ip, extra=fields(event="proxy_egress", ip=ip))
 
 
 def beat(config: Config) -> None:
@@ -137,6 +177,7 @@ async def run() -> None:
             proxied=bool(config.proxy),
         ),
     )
+    await probe_egress(config.proxy)
 
     stop = asyncio.Event()
     loop = asyncio.get_running_loop()

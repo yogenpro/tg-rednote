@@ -43,12 +43,12 @@ notes (images, Ultra-HDR albums, videos, forwarded messages, `.com` and `.cn` li
 
 - [ ] **Split routing is untested against a real proxy.** The plumbing is unit-tested and the
       sidecar's `proxy` field was verified live (a dead proxy fails the fetch), but no traffic
-      has yet gone through an actual Tailscale exit node. Check both IPs differ once the home
-      machine is advertising itself as one. Two things to confirm on that first run, both
-      reasoned out rather than observed: that the container's healthcheck really does go green
-      once an exit node is in use (`"ExitNode": true` was verified as absent when none is set,
-      never as present when one is), and whether a userspace node inside a Docker bridge gets a
-      direct path home or settles for DERP.
+      has yet gone through the home proxy — neither it nor the exit-node design it replaced
+      has carried a byte. Three things to confirm on first run: that both containers can
+      reach the proxy's tailnet IP through the host's route (the one genuinely new
+      assumption — rule out a host firewall before blaming the bot), that the `proxy_egress`
+      startup line names the home network's IP and differs from what Telegram sees, and that
+      a sidecar fetch still succeeds with `proxy` in its payload.
 
 - [ ] **No way to unpublish.** The bot has `can_delete_messages` in both chats and
       `state.forget_published()` exists, but no command is wired up. Removing a post today means
@@ -139,8 +139,9 @@ notes (images, Ultra-HDR albums, videos, forwarded messages, `.com` and `.cn` li
   1point3acres, the CDNs behind them, and anything added later — through a proxy, while
   Telegram, telegra.ph and the sidecar hop go direct. Default-on rather than an allowlist
   since 2026-08-22; the three exemptions are pinned with `trust_env=False` so no environment
-  variable can move them. Optional `tailscale` compose profile provides the proxy via a
-  tailnet exit node, userspace mode.
+  variable can move them. The proxy is a plain HTTP forward proxy on a tailnet box (tinyproxy
+  on the home machine, since 2026-08-23, replacing a second userspace tailnet node that never
+  ran live); the bot proves the egress at startup with one logged fetch (`proxy_egress`).
 
 - Packaging: image builds and runs as uid 10001, heartbeat-based HEALTHCHECK, defaults that let
   `docker run` work without compose, `.dockerignore`, optional `.env`, log caps, ordered start

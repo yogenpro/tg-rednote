@@ -357,7 +357,7 @@ The three exemptions are pinned in code with `trust_env=False`, not by configura
 environment variable — yours, the host's, or one set by accident — can route them.
 
 ```
-PROXY=http://tailscale:1055
+PROXY=http://100.101.102.103:8888
 ```
 
 `XHS_PROXY` is still read as the old name for the same setting, from when the proxy carried
@@ -369,73 +369,74 @@ IP as well as its User-Agent. If the `/acres` paste comes from a browser on the 
 proxying makes the session *more* consistent; if it comes from somewhere else, expect to
 re-paste it.
 
-Any HTTP proxy works. The compose file ships an optional Tailscale one that exits through a
-machine on your tailnet — a Raspberry Pi at home, say:
+Any HTTP proxy works. The natural one on a tailnet is a plain forward proxy on a machine you
+already keep at home — a Raspberry Pi, say:
 
 ```bash
-# .env
-TS_AUTHKEY=tskey-auth-...     # Tailscale admin console → Settings → Keys
-TS_EXIT_NODE=home-pi          # the home machine, advertising itself as an exit node
-PROXY=http://tailscale:1055
+# on the home box, once:
+sudo apt install tinyproxy
+sudo $EDITOR /etc/tinyproxy/tinyproxy.conf
+#   Port 8888
+#   Allow 100.64.0.0/10        # the tailnet range; refuse everyone else
+sudo systemctl enable --now tinyproxy
 
-docker compose --profile tailscale up -d
+# .env on the server — the home box's tailnet IP, `tailscale ip -4` run on it:
+PROXY=http://100.101.102.103:8888
+docker compose up -d
 ```
 
-The exit node has to be advertised (`tailscale up --advertise-exit-node` on the home machine)
-and approved in the admin console.
+The server has to be able to reach that address. If it already runs tailscaled — the
+expected case — nothing needs configuring: both the bot and the sidecar container route to a
+tailnet IP through the host. If it doesn't, `tailscale up` on the host is the one
+prerequisite. A tailnet ACL letting only this server open the proxy's port is cheap depth on
+top of `Allow`, and so is BasicAuth — `http://user:pass@100.101.102.103:8888` needs no code
+change.
 
-### Why a second node, when the server already runs tailscaled
+### Why a forward proxy, not the host's exit node
 
 Most servers worth deploying this on are already on your tailnet, and the obvious move is to
-reuse that daemon. It cannot do this job. **An exit node is a per-device setting**: point the
-host's tailscaled at home and *everything* on that machine goes home — Telegram, media uploads,
-every other container you run there — and the host loses internet outright whenever the home
-box is offline. There is no per-process or per-container variant of it; app-based split
-tunnelling exists only on Android. Tailscale's own answer for domain-scoped routing is
+point the host's tailscaled at the home box and call it done. It cannot do this job. **An
+exit node is a per-device setting**: point the host's tailscaled at home and *everything* on
+that machine goes home — Telegram, media uploads, every other container you run there — and
+the host loses internet outright whenever the home box is offline. There is no per-process or
+per-container variant of it; app-based split tunnelling exists only on Android. Tailscale's
+own answer for domain-scoped routing is
 [app connectors](https://tailscale.com/kb/1281/app-connectors), and their
 [best practices](https://tailscale.com/docs/reference/best-practices/app-connectors) tell you
 not to point one at a CDN — which is what nearly every XHS byte comes from. It also fails
 *open*: a domain whose route hasn't been learned just leaves from the server's IP, unlogged.
 
-So the profile brings a node of its own, and the two daemons coexist without touching:
-
-- **Userspace mode** means no `TUN` device, no `NET_ADMIN`, no iptables rules and no entry in
-  the host's routing table. The container's tailscaled lives entirely inside its network
-  namespace, with its own machine key and its own state volume.
-- **The host's tailscaled needs no changes** — and specifically should *not* have an exit node
-  set. If it does, the split is already lost.
-- **It is free.** On the Personal plan user devices are unlimited, so an untagged auth key
-  costs nothing; a tagged one spends 1 of the 50 included tagged resources.
-- Its only exposed surface is the HTTP proxy on the compose network, so nothing else on the
-  machine can accidentally start using the tunnel.
-
-The two costs are worth knowing. The admin console gains a second row for one machine — hence
-`TS_HOSTNAME`, defaulting to `tg-rednote-xhs` rather than something that reads like the host —
-and `tailscale status` on the host will not show it; ask the container instead. And two nodes
-behind one NAT, one of them inside a Docker bridge, may not find a direct path home and fall
-back to a DERP relay. That is slower, not broken, and `tailscale status` names it.
+A forward proxy inverts the default the same way `PROXY` itself does: the home link carries
+exactly the requests the bot hands it, nothing else on the server knows it exists, and a
+proxy that is down fails those requests loudly instead of quietly exiting from the server's
+own IP. An earlier revision of this README shipped a compose profile running a second,
+userspace tailnet node against an exit node; it was removed before it ever carried traffic.
+Its healthcheck had to *assert* the exit node was in use, because a node with none set serves
+the proxy just as happily — and that whole failure mode cannot exist here: a proxy egresses
+from wherever it runs, and there is no route table to lose. What else the swap deleted: the
+auth key that would have expired one day and silently killed the proxy on restart, and the
+second node in the admin console.
 
 ### Sanity checks once it's up
 
 ```bash
-docker compose exec tailscale tailscale status | head -3   # 'direct' or 'relay' shows here
-docker compose exec tailscale tailscale ip -4
 # what a fetch would see:
-docker compose exec bot python -c "import httpx;print(httpx.get('https://api.ipify.org',proxy='http://tailscale:1055').text)"
+docker compose exec bot python -c "import httpx;print(httpx.get('https://api.ipify.org',proxy='http://100.101.102.103:8888').text)"
 # and what Telegram sees, which should differ:
 docker compose exec bot python -c "import httpx;print(httpx.get('https://api.ipify.org',trust_env=False).text)"
 ```
 
-The container's healthcheck asserts the *exit node* is in use, not merely that the daemon is
-up: a node with no exit node serves the proxy just as happily and quietly exits from the
-server's own IP, which is the one failure this whole arrangement exists to prevent. So
-`docker compose ps` showing `xhs-tailscale` as healthy is itself the check that the split is
-live.
+The bot does the first of those itself at startup: one best-effort fetch through the proxy,
+logged as `proxy_egress` with the IP it came back on — or the exception type, if the proxy
+could not be reached, in which case the bot still starts and says so at warning level. That
+line is the check that the split is live; read it once after first boot and again whenever
+the proxy's address changes.
 
-One thing the proxy does not move: DNS. `TS_ACCEPT_DNS` is off, so tailscaled resolves XHS
-hostnames through the container's resolver — from the server's vantage point — and only the
-connection itself is made from home. XHS sees the home IP either way, which is what the walls
-key on; it may just pick a CDN edge near the server.
+One thing the proxy *does* move, quietly: DNS. An HTTP proxy is handed the hostname, not an
+address, so the home box — not the server — resolves XHS's names, and CDN edges get picked
+near the home network. That is closer to what a browser at home sees than the exit-node
+arrangement this replaced, where names resolved at the server and only the connection came
+from home.
 
 `/status` shows the proxy when one is set. If the proxy dies, fetches fail while the bot stays
 up and answers — it does not silently fall back to the server's own IP.

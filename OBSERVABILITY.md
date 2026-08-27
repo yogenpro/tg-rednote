@@ -30,6 +30,7 @@ a single note's whole journey comes out with one filter — which is the differe
 | `event` | When | Fields worth querying |
 |---|---|---|
 | `startup` | Process start | `media_mode`, `comments`, `channel`, `dm_mode` (the default for users who never chose), `groups`, `proxied` |
+| `proxy_egress` | The startup probe through `PROXY` named its exit IP | `ip` on success; `error` (exception type) when the proxy could not be reached |
 | `submission` | A link arrives | `source` = `dm` \| `group`, `site`, `private` (a DM the sender keeps out of the channel) |
 | `note` | Metadata in hand | `kind` = `image` \| `video` \| `thread`, `items`, `cached`, `origin` = `sidecar` \| `page` |
 | `comments` | Comment scrape done | `count` |

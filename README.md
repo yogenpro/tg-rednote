@@ -302,6 +302,14 @@ back in the caption.
   Whole comments are dropped from the end rather than cut mid-sentence. If the scrape fails the
   note is delivered anyway.
 
+* **Comment pictures** (a thing XHS commenters do — “here's mine” with a photo) go out as one
+  small album per comment, sent after everything else and captioned `📷 from <author>'s
+  comment`, so the credit lands on whoever posted them. Each comment's text carries a 📷
+  marker linking its pictures — to the album itself once that exists (the marker is edited
+  after sending, the same trick the “continues ↓” links use), or to the full-size image where
+  no permalink exists (a DM). An *image-only* comment — no text, just pictures — is delivered
+  the same way. At most ten comment photos ride along; markers always link the rest.
+
 ---
 
 ## Configuration

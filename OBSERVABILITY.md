@@ -33,8 +33,9 @@ a single note's whole journey comes out with one filter — which is the differe
 | `proxy_egress` | The startup probe through `PROXY` named its exit IP | `ip` on success; `error` (exception type) when the proxy could not be reached |
 | `submission` | A link arrives | `source` = `dm` \| `group`, `site`, `private` (a DM the sender keeps out of the channel) |
 | `note` | Metadata in hand | `kind` = `image` \| `video` \| `thread`, `items`, `cached`, `origin` = `sidecar` \| `page` |
-| `comments` | Comment scrape done | `count` |
+| `comments` | Comment scrape done | `count`, `images` (how many pictures they carry) |
 | `delivery` | Media sent | `items`, `seconds`, `mode` = `url` \| `upload` \| `telegraph`, `skipped` |
+| `comment_gallery` | Comment pictures delivered as albums | `images`, `albums` |
 | `published` | Live on the channel | `message_id`, `url` |
 | `duplicate` | Already published | `url` of the original |
 | `dm_mode` | Someone changed where their DMs go | `user`, `mode` = `channel` \| `private` |

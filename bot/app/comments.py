@@ -55,10 +55,38 @@ def _clean(value: str) -> str:
     return _STICKER_RE.sub("", value or "").strip()
 
 
+def _picture_urls(raw: dict[str, Any]) -> list[str]:
+    """Full-size URLs for a comment's pictures.
+
+    Each picture carries two: `originUrl` is the original (1440 px-ish JPEG,
+    ~150 KB) and `url` a ~360 px webp preview XHS generates for list views —
+    deliver the original, not the thumbnail. The CDN serves both schemes and
+    asks for no referer (verified live on the comment-picture note), so the
+    scheme is normalised to https on the way in: a plain `http://` href is a
+    mixed-content link once anything ever re-renders it on a page.
+    """
+    urls: list[str] = []
+    for picture in raw.get("pictures") or []:
+        if not isinstance(picture, dict):
+            continue
+        url = str(picture.get("originUrl") or picture.get("url") or "")
+        if url.startswith("http://"):
+            url = "https://" + url[len("http://") :]
+        if url:
+            urls.append(url)
+    return urls
+
+
 def _one(raw: dict[str, Any], *, with_replies: bool) -> Comment | None:
     text = _clean(raw.get("content") or "")
     author = (raw.get("user") or {}).get("nickname") or ""
-    if not text:
+    images = _picture_urls(raw)
+    # An image-only comment (content: "", pictures: […]) is still a comment —
+    # on purchase-showcase notes it is often the whole point. Only a comment
+    # with neither text nor pictures is nothing. (An empty one that carries
+    # replies is still dropped with them; nothing was ever rendered for it to
+    # hang them off — see TODO.)
+    if not text and not images:
         return None
     likes = str(raw.get("likeViewCount") or raw.get("likeCount") or "").strip()
     comment = Comment(
@@ -66,6 +94,7 @@ def _one(raw: dict[str, Any], *, with_replies: bool) -> Comment | None:
         text=text,
         likes="" if likes in ("", "0") else likes,
         location=(raw.get("ipLocation") or "").strip(),
+        images=images,
     )
     if with_replies:
         for sub in raw.get("subComments") or []:
@@ -130,13 +159,65 @@ def _render_one(comment: Comment, *, reply: bool, like: str = "♥") -> str:
         head += f" <i>({escape(meta)})</i>"
     for index, url in enumerate(comment.images, start=1):
         # Markup and href targets are free against Telegram's limit, so the
-        # marker costs two units however long the URL is.
+        # marker costs two units however long the URL is. The href is the
+        # full-size CDN image, which works anywhere; once the comment's own
+        # album has been sent, `relink_images` upgrades it to a link to that
+        # message — the send-then-edit trick the `continues ↓` chain uses,
+        # for the same reason: message ids are not predictable in advance.
         label = "📷" if len(comment.images) == 1 else f"📷{index}"
         head += f' <a href="{escape(url, quote=True)}">{label}</a>'
-    return f"{head}\n{escape(comment.text)}"
+    if comment.text:
+        return f"{head}\n{escape(comment.text)}"
+    return head
 
 
 HEADER = "— top comments —"
+
+# One album per comment is the point — the credit lands on whoever posted the
+# pictures — but the total is capped so a thread of camera-happy commenters
+# cannot bury the note above. Markers for whatever falls past the cap still
+# link the full-size image, so nothing goes silently missing.
+ALBUM_BUDGET = 10
+
+
+def comment_albums(
+    comments: list[Comment], limit: int = ALBUM_BUDGET
+) -> list[tuple[str, list[str]]]:
+    """One album per image-carrying comment: (caption, urls), in thread order.
+
+    They travel separately from the note's own album for the same reason the
+    forum's reply pictures do: an album's caption is the note author's, and
+    someone else's photo under it credits the wrong person. Delivered in
+    comment order after everything else, so the 📷 markers above map onto the
+    albums below.
+    """
+    albums: list[tuple[str, list[str]]] = []
+    remaining = limit
+    for comment in comments:
+        if not comment.images or remaining <= 0:
+            continue
+        urls = comment.images[:remaining]
+        remaining -= len(urls)
+        whose = f"{escape(comment.author)}'s" if comment.author else "a"
+        albums.append((f"📷 from {whose} comment", urls))
+    return albums
+
+
+def relink_images(html: str, links: dict[str, str]) -> str:
+    """Point 📷 markers at the albums that were sent for them.
+
+    `links` maps a picture's CDN URL to the message that delivered it. Only
+    the marker anchors carry these URLs as hrefs — comment text is escaped
+    plain text and the note's own footer links elsewhere — so replacing the
+    href attribute is exact. A URL with no entry keeps its CDN href: that is
+    the marker of a picture past the album budget, or of a delivery with no
+    permalink (a DM has none), and the raw image is still one tap away.
+    """
+    for url, target in links.items():
+        html = html.replace(
+            f'href="{escape(url, quote=True)}"', f'href="{escape(target, quote=True)}"'
+        )
+    return html
 
 
 def _pack(
@@ -180,9 +261,20 @@ def render_comments(comments: list[Comment], *, limit: int, like: str = "♥") -
     blocks, used, stopped = _pack(comments, limit=limit, like=like)
     if stopped == 0:  # not even the first one fits: keep something rather than nothing
         first = comments[0]
-        skeleton = Comment(first.author, "", first.likes, first.location, first.replying_to)
-        fixed = tg_len(_visible(_render_one(skeleton, reply=False, like=like))) + 2
-        room = limit - used - fixed - 1  # the ellipsis costs one
+        # The skeleton is the first comment with its text emptied: its 📷
+        # markers stay, because the shortened comment renders them too and the
+        # budget has to pay for what will actually be sent.
+        skeleton = Comment(
+            first.author, "", first.likes, first.location, first.replying_to,
+            images=first.images,
+        )
+        # Four units on top of the skeleton as rendered: the blank line
+        # (two) that separates the block, the line break the text sits behind,
+        # and the ellipsis that will end it. (The break used to be paid for by
+        # a phantom newline the skeleton rendered with; an image-only comment
+        # no longer renders one, so it is counted here instead.)
+        fixed = tg_len(_visible(_render_one(skeleton, reply=False, like=like))) + 4
+        room = limit - used - fixed
         if room < 20:
             return ""
         head, _rest = tg_truncate(first.text, room)
@@ -190,6 +282,7 @@ def render_comments(comments: list[Comment], *, limit: int, like: str = "♥") -
             return ""
         shortened = Comment(
             first.author, f"{head}…", first.likes, first.location, first.replying_to,
+            images=first.images,
         )
         blocks = [_render_one(shortened, reply=False, like=like)]
 

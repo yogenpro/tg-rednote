@@ -1,9 +1,23 @@
 # TODO
 
-Status as of 2026-08-22. Tests: 244 passing. The bot has been exercised live against ~15 real
+Status as of 2026-09-04. Tests: 263 passing. The bot has been exercised live against ~15 real
 notes (images, Ultra-HDR albums, videos, forwarded messages, `.com` and `.cn` links).
 
 ## Open
+
+- [ ] **Comment pictures have not been observed live end-to-end.** The parse is written and
+      tested against the real payload of note `6a98fdd1…`, but whether Telegram's own fetcher
+      accepts `sns-img-qc.xhscdn.com/comment/…` URLs — or refuses them so `auto` mode streams
+      the bytes through — is unobserved. Either way it should self-heal; the first live note
+      will say which.
+
+- [ ] **An empty comment with no pictures and replies still loses them both.** XHS serves
+      comments with `content: ""`, no `pictures`, and `subComments` present (seen live on the
+      same note, `commentType: 5`); the parse drops it and its replies with it. Keeping it
+      would mean rendering a header-only comment line for its replies to hang off — fine when
+      it has replies, odd when it has none, so the rule would be "keep if text, pictures, or
+      replies". Deliberately not done with the picture feature: it changes what a comment
+      *without* pictures renders like, which the feature was not asked about.
 
 - [ ] **A published telegra.ph page is only remembered for the cache TTL.** The URL lives on
       the cached `Thread`, so a resubmission six hours later publishes a second page for the

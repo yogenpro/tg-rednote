@@ -131,6 +131,34 @@ one without `web_session` now says so in the reply.
 header, but `window.__INITIAL_STATE__` embeds the first five top-level comments with replies,
 cookieless. It's best-effort: a parse miss returns `[]` and the note still delivers.
 
+**A comment can carry pictures, and one of them is sometimes the whole comment.** Top-level
+comments may carry a `pictures` array (sub-comments never have the key); each picture has an
+`originUrl` — the full-size JPEG, ~150 KB — and a `url` that is a 360 px webp preview XHS
+builds for list views. Deliver the original, never the thumbnail, and normalise the scheme to
+https on the way in: the CDN serves both schemes and asks for no referer (verified live on
+note `6a98fdd1…`, 2026-09-04). An *image-only* comment (`content: ""`, pictures present) is a
+real comment — on purchase-showcase notes it is often the whole point — so the parse rule is
+"keep if text or pictures". (An empty comment with *no* pictures is still dropped with its
+replies; that shape exists too and is in TODO.)
+
+**Comment pictures go out as one album per comment, and the marker is relinked after.**
+They never join the note's own album — an album's caption is the author's, the same mistake
+the forum path guards against — but travel after everything else, each set captioned
+`📷 from <author>'s comment` and replying to the message before it, in comment order, under a
+shared budget of ten photos. The 📷 marker in the comment text starts as a link to the
+full-size CDN image, then — once the albums exist — is upgraded by *editing* the carrying
+message to point at the album's permalink: send-then-edit, the same trick `continues ↓` uses,
+for the same reason (message ids are not predictable), and folded into the same edit so each
+message is touched once. Only the channel has permalinks to point at; in a DM the marker keeps
+the CDN href, which is still one tap away. The relink rewrites the exact `href="…"` attribute,
+which only the marker anchors carry — comment text is escaped plain text, so an incidental
+match cannot happen. One more trap in the neighbourhood: the truncation path of
+`render_comments` rebuilds the comment it shortens, and a rebuild that forgot `images` both
+lost the markers and unbudgeted their two units each — a markered comment could overflow the
+limit Telegram enforces. The comment-picture CDN is a family of its own
+(`sns-img-qc.xhscdn.com/comment`) that Telegram's fetcher has not yet been seen to accept or
+refuse; `auto` mode learns it either way, same as the note families.
+
 **Caption priority order**: the note's text first, comments only with what's left. If the text
 overflows at all, comments move to the follow-up message entirely (and ride inside the last
 text chunk, so an overflowing note costs two messages, not three). An earlier version reserved

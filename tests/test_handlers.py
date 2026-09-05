@@ -92,6 +92,18 @@ class FakeSender:
         return None
 
 
+class TickingSender(FakeSender):
+    """Distinct message ids per send, as Telegram hands out."""
+
+    async def send(self, chat_id, items, caption, *, reply_to=None, part_from=1, part_total=None):
+        self.sends.append((chat_id, list(items), caption, reply_to, part_from))
+        mid = self.next_message_id
+        self.next_message_id += 1
+        return SendReport(
+            sent=len(items), first_message_id=mid, parts=[(mid, caption)]
+        )
+
+
 def make_bot(tmp_path, *, downloader=None, owner=None, **config_kwargs) -> tuple[Bot, FakeTelegram, State]:
     config = Config(bot_token="t", state_path=tmp_path / "state.json", **config_kwargs)
     state = State(config.state_path)
@@ -511,6 +523,89 @@ async def test_comments_ride_in_the_album_caption(tmp_path):
     assert "Title" in caption  # the note text is still there
     # Nothing was posted as a separate follow-up message.
     assert telegram.sent == []
+
+
+@pytest.mark.asyncio
+async def test_comment_pictures_go_out_as_one_album_per_comment(tmp_path):
+    """Each author's set under their own name, after everything else — never
+    mixed into the note's album, whose caption is the note author's."""
+    from app.comments import Comment
+
+    comments = [
+        Comment("虎牙", "好吃", likes="10", images=["https://cdn/c1", "https://cdn/c2"]),
+        Comment("路人", "no pictures here"),
+        Comment("", "", images=["https://cdn/c3"]),
+    ]
+    bot, telegram, _ = make_bot(
+        tmp_path, downloader=FakeDownloader(NOTE, comments=comments), owner=1
+    )
+    bot.sender = TickingSender()
+    await bot.handle_update(message("http://xhslink.com/o/x"))
+
+    assert len(bot.sender.sends) == 3  # the note, then one album per comment
+    chat, items, caption, reply_to, _part = bot.sender.sends[0]
+    assert [i.url for i in items] == ["https://cdn/1", "https://cdn/2"]
+
+    first, second = bot.sender.sends[1], bot.sender.sends[2]
+    assert [i.url for i in first[1]] == ["https://cdn/c1", "https://cdn/c2"]
+    assert first[2] == "📷 from 虎牙's comment"
+    assert [i.url for i in second[1]] == ["https://cdn/c3"]
+    assert second[2] == "📷 from a comment"
+    # Each album replies to the message before it, so they read as attached.
+    assert first[3] == 1 and second[3] == 2
+    # No permalink exists in a DM, so the marker keeps the full-size image.
+    assert '<a href="https://cdn/c1">📷1</a>' in caption
+    assert '<a href="https://cdn/c2">📷2</a>' in caption
+    assert telegram.edits == []
+
+
+@pytest.mark.asyncio
+async def test_channel_markers_are_relinked_to_the_comment_albums(tmp_path):
+    """Send first, edit after: once the albums exist, the 📷 markers point at
+    them, and the `continues ↓` chain threads through the albums too."""
+    from app.comments import Comment
+
+    comments = [Comment("虎牙", "好吃", images=["https://cdn/c1"])]
+    bot, telegram, _ = channel_bot(
+        tmp_path, downloader=FakeDownloader(NOTE, comments=comments)
+    )
+    bot.sender = TickingSender()
+    await bot.handle_update(message("http://xhslink.com/o/x"))
+
+    assert len(bot.sender.sends) == 2
+    assert bot.sender.sends[1][3] == 1  # the album replies to the post
+    # One edit for the post's caption: the upgraded marker, and the chain
+    # link to the album that follows it.
+    assert len(telegram.edits) == 1
+    chat_id, message_id, body = telegram.edits[0]
+    assert (chat_id, message_id) == (-1001234567890, 1)
+    assert '<a href="https://t.me/mychannel/2">📷</a>' in body
+    assert 'href="https://cdn/c1"' not in body
+    assert "continues ↓" in body and "https://t.me/mychannel/2" in body
+
+
+@pytest.mark.asyncio
+async def test_a_refused_comment_album_costs_its_pictures_not_the_note(tmp_path):
+    from app.comments import Comment
+
+    comments = [Comment("虎牙", "好吃", images=["https://cdn/c1"])]
+    bot, telegram, _ = make_bot(
+        tmp_path, downloader=FakeDownloader(NOTE, comments=comments), owner=1
+    )
+
+    class RefusesTheSecondAlbum(TickingSender):
+        async def send(self, chat_id, items, caption, *, reply_to=None, part_from=1, part_total=None):
+            if len(self.sends) >= 1:  # the note album went out already
+                raise TelegramError("sendMediaGroup", 400, "Bad Request: WEBPAGE_CURL_FAILED")
+            return await super().send(chat_id, items, caption, reply_to=reply_to, part_from=part_from)
+
+    bot.sender = RefusesTheSecondAlbum()
+    await bot.handle_update(message("http://xhslink.com/o/x"))
+
+    # The note was delivered with its comments intact; the album's failure
+    # said so and moved on.
+    assert len(bot.sender.sends) == 1
+    assert "好吃" in bot.sender.sends[0][2]
 
 
 @pytest.mark.asyncio

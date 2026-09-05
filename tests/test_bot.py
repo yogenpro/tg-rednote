@@ -842,14 +842,17 @@ def _state_page(comments: list[dict]) -> str:
     return "<html><script>window.__INITIAL_STATE__=" + json.dumps(payload) + "</script></html>"
 
 
-def _raw(content, nickname="someone", likes="10", location="美国", subs=()):
-    return {
+def _raw(content, nickname="someone", likes="10", location="美国", subs=(), pictures=None):
+    raw = {
         "content": content,
         "user": {"nickname": nickname},
         "likeViewCount": likes,
         "ipLocation": location,
         "subComments": list(subs),
     }
+    if pictures is not None:
+        raw["pictures"] = pictures
+    return raw
 
 
 def test_parse_comments_reads_the_embedded_state():
@@ -925,6 +928,117 @@ def test_rendered_comments_escape_html():
     assert "&lt;b&gt;not bold&lt;/b&gt;" in block
     assert "&lt;script&gt;" in block
     assert "<script>" not in block
+
+
+def test_parse_comments_reads_pictures():
+    """The payload shape seen live on note 6a98fdd1…: each top-level comment
+    may carry `pictures` with an `originUrl` (full-size) and a `url` (a 360 px
+    webp preview). The original is delivered, over https; the preview is a
+    thumbnail and is not.
+    """
+    from app.comments import parse_comments
+
+    page = _state_page([
+        _raw("mine too", nickname="甲", pictures=[
+            {"originUrl": "http://sns-img-qc.xhscdn.com/comment/abc",
+             "url": "http://sns-na-i8.xhscdn.com/comment/abc?imageView2/2/w/360/format/webp",
+             "width": 1440, "height": 1920},
+            {"originUrl": "http://sns-img-qc.xhscdn.com/comment/def"},
+        ]),
+        # An image-only comment (content "", pictures present) is a comment.
+        _raw("", nickname="乙", pictures=[
+            {"originUrl": "https://sns-img-qc.xhscdn.com/comment/ghi"}
+        ]),
+        # Neither text nor pictures: nothing to show (its replies go with it).
+        _raw("", nickname="丙", subs=[_raw("a reply", nickname="丁")]),
+    ])
+    comments = parse_comments(page)
+
+    assert [c.author for c in comments] == ["甲", "乙"]
+    assert comments[0].images == [
+        "https://sns-img-qc.xhscdn.com/comment/abc",
+        "https://sns-img-qc.xhscdn.com/comment/def",
+    ]
+    assert comments[1].images == ["https://sns-img-qc.xhscdn.com/comment/ghi"]
+    assert comments[2:] == []
+
+
+def test_rendering_an_image_only_comment_leaves_no_blank_line():
+    from app.comments import parse_comments, render_comments
+
+    comments = parse_comments(_state_page([
+        _raw("", nickname="乙", likes="47", location="北京", pictures=[
+            {"originUrl": "https://cdn/comment/one"}
+        ]),
+    ]))
+    block = render_comments(comments, limit=4000)
+
+    assert '<a href="https://cdn/comment/one">📷</a>' in block
+    assert "北京" in block
+    # Header-only: no dangling blank line where the text would have been.
+    assert not block.endswith("\n")
+
+
+def test_comment_albums_group_per_comment_with_a_shared_budget():
+    from app.comments import Comment, comment_albums
+
+    a = Comment("甲", "text", images=["https://cdn/a1", "https://cdn/a2"])
+    b = Comment("", "", images=["https://cdn/b1"])
+    c = Comment("丙", "no pictures")
+    d = Comment("丁 <ev&il>", "text", images=["https://cdn/d1"])
+
+    albums = comment_albums([a, b, c, d])
+    assert [(caption, urls) for caption, urls in albums] == [
+        ("📷 from 甲's comment", ["https://cdn/a1", "https://cdn/a2"]),
+        ("📷 from a comment", ["https://cdn/b1"]),
+        ("📷 from 丁 &lt;ev&amp;il&gt;'s comment", ["https://cdn/d1"]),
+    ]
+    # The budget is shared: once ten pictures have gone out, later comments
+    # keep only their 📷 markers, and a long set is cut not dropped whole.
+    many = [Comment(f"u{i}", "t", images=[f"https://cdn/{i}-1", f"https://cdn/{i}-2"])
+            for i in range(8)]
+    capped = comment_albums(many)
+    assert sum(len(urls) for _c, urls in capped) == 10
+    assert capped[-1][1] == ["https://cdn/4-1", "https://cdn/4-2"]
+
+
+def test_relink_images_upgrades_markers_and_leaves_the_rest_alone():
+    from app.comments import Comment, relink_images, render_comments
+
+    comment = Comment("甲", "look", images=["https://cdn/a1"])
+    block = render_comments([comment], limit=4000)
+    other = '<a href="https://cdn/a1-something-else">open on RedNote</a>'
+
+    out = relink_images(
+        block + other, {"https://cdn/a1": "https://t.me/c/1/43"}
+    )
+
+    assert '<a href="https://t.me/c/1/43">📷</a>' in out
+    assert 'href="https://cdn/a1"' not in out
+    # A different URL entirely — including one that merely starts with the
+    # mapped one — is untouched.
+    assert other in out
+    unmapped = relink_images(block, {})
+    assert unmapped == block
+
+
+def test_a_truncated_first_comment_keeps_its_markers_within_budget():
+    """The shortening path rebuilds the comment; its 📷 markers must survive
+    that rebuild *and* be paid for in the budget — a marker costs two units
+    and an unbudgeted one overflows the limit Telegram enforces."""
+    from app.comments import parse_comments, render_comments
+
+    comments = parse_comments(_state_page([
+        _raw("z" * 5000, nickname="u", pictures=[
+            {"originUrl": "https://cdn/p1"}, {"originUrl": "https://cdn/p2"},
+        ]),
+    ]))
+    block = render_comments(comments, limit=400)
+
+    assert 0 < tg_len(visible(block)) <= 400
+    assert '<a href="https://cdn/p1">📷1</a>' in block
+    assert '<a href="https://cdn/p2">📷2</a>' in block
+    assert block.endswith("…")
 
 
 # ---- split routing ---------------------------------------------------

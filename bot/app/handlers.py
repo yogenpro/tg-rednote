@@ -27,7 +27,13 @@ from .acres import looks_like_cookie as looks_like_acres_cookie
 from .cache import LRU
 from .config import Config
 from .logs import current_rid, fields, new_rid
-from .comments import fit_into_caption, render_comments, strip_tags
+from .comments import (
+    comment_albums,
+    fit_into_caption,
+    relink_images,
+    render_comments,
+    strip_tags,
+)
 from .media import MEDIA_GROUP_LIMIT, MediaSender, build_caption, split_message, tg_len
 from .state import State, generate_pairing_code
 from .telegraph import Telegraph, TelegraphError, trim
@@ -1392,6 +1398,62 @@ class Bot:
                 chain.append((sent, piece, False))
                 previous = sent
 
+        # A comment's pictures, each set under its author's name. They come
+        # after everything else and reply to it, so they read as attached to
+        # the thread above rather than to the note. A refused or empty album
+        # costs its pictures, not the delivery — the note is already out.
+        links: dict[str, str] = {}
+        delivered = 0
+        albums_sent = 0
+        for caption, urls in comment_albums(comments):
+            try:
+                async with self._busy(chat_id, "upload_photo") if chat_id else _nothing():
+                    part = await self.sender.send(
+                        target,
+                        [MediaItem("photo", url) for url in urls],
+                        caption,
+                        reply_to=previous,
+                    )
+            except TelegramError as exc:
+                log.warning(
+                    "comment pictures for %s were refused: %s",
+                    note.note_id or "?", exc.description,
+                    extra=fields(
+                        event="media_skipped", note=note.note_id, count=len(urls)
+                    ),
+                )
+                continue
+            if not part.sent:
+                continue
+            delivered += part.sent
+            albums_sent += 1
+            previous = part.first_message_id or previous
+            chain.extend((mid, cap, True) for mid, cap in part.parts)
+            # The 📷 markers are upgraded to point here — but only where a
+            # permalink exists to point at, which for a bot means the channel;
+            # in a DM or a group the marker keeps the full-size CDN image,
+            # which is still one tap away, and the album sits right below.
+            if channel and part.first_message_id:
+                where = self.message_link(part.first_message_id)
+                if where:
+                    links.update({url: where for url in urls})
+        if delivered:
+            log.info(
+                "comment pictures for %s: %d photo(s) in %d album(s)",
+                note.note_id or "?", delivered, albums_sent,
+                extra=fields(
+                    event="comment_gallery", note=note.note_id,
+                    images=delivered, albums=albums_sent,
+                ),
+            )
+            # Rewrite the markers before the chain is linked, so each message
+            # is edited once for both.
+            if links:
+                chain = [
+                    (mid, relink_images(body, links), is_caption)
+                    for mid, body, is_caption in chain
+                ]
+
         # A reply chain is invisible once a message is forwarded out of the
         # channel, so each message also carries a link to the next one.
         if channel and len(chain) > 1:
@@ -1474,7 +1536,10 @@ class Bot:
             return []
         log.info(
             "comments for %s: %d fetched", note.note_id or "?", len(comments),
-            extra=fields(event="comments", note=note.note_id, count=len(comments)),
+            extra=fields(
+                event="comments", note=note.note_id, count=len(comments),
+                images=sum(len(c.images) for c in comments),
+            ),
         )
         return comments
 

@@ -214,7 +214,11 @@ lost while you fix the permission.
 
 A note that doesn't fit one message becomes several: the album first (split into `[1/n]` parts
 if it runs past Telegram's 10-item limit), then any description overflow, then the top comments
-— each replying to the one before, so the post threads properly in the channel.
+— each replying to the one before, so the post threads properly in the channel. When the album
+itself splits, the overflow text rides the captions of the `[2/n]`… parts — an album past ten
+items is already paying for a message per extra part, and a part wearing nothing but its
+`[2/2]` marker is wasted caption space — and only what won't fit there becomes messages of its
+own.
 
 A reply chain is invisible once a post is forwarded out of the channel, though: the reader gets
 the first message and no way to reach the rest. So every message but the last also carries a
@@ -289,7 +293,10 @@ back in the caption.
   (hashtags, author, source link) and the rest follows.
 * **Albums over 10 items** are split across several media groups, because that is Telegram's
   hard limit. Each part is captioned `[1/3]`, `[2/3]`, … and replies to the part before it, so
-  the whole set reads as one threaded post rather than loose albums.
+  the whole set reads as one threaded post rather than loose albums. The parts after the first
+  also carry the description overflow and the top comments in their captions when there is any
+  — a photo-overflow part wearing only its marker plus a separate text message behind it is two
+  messages where one would do.
 * **Top comments** (up to `COMMENTS`, default 5) come with each note — replies, like counts and
   poster location included. They are scraped from the note page: XHS's comment API needs a
   signed header, but the page embeds the first few comments. Where they land follows one rule —

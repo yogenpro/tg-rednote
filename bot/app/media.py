@@ -158,6 +158,10 @@ class SendReport:
     # (message id, caption HTML) for the caption-bearing message of each group,
     # so a caller can go back and append a "continued" link.
     parts: list[tuple[int, str]] = field(default_factory=list)
+    # Follow-up captions a group could not carry because every item in it was
+    # dropped. The text must not go down with the photos, so the caller gets
+    # it back to send as a message.
+    unused_captions: list[str] = field(default_factory=list)
 
 
 def media_family(url: str) -> str:
@@ -353,15 +357,23 @@ class MediaSender:
         reply_to: int | None = None,
         part_from: int = 1,
         part_total: int | None = None,
+        followup_captions: list[str] | None = None,
     ) -> SendReport:
         """Send an album, chunked to Telegram's ten-item limit.
 
         `part_from`/`part_total` let one album be split across two destinations
         — a channel post and its discussion thread — while the "[2/3]" markers
         keep counting from where the previous destination left off.
+
+        `followup_captions` fills the groups after the first, in order. Without
+        it a photo-overflow group carries only its "[2/2]" marker — a caption
+        Telegram gives it for free — while the note's text overflow goes out as
+        a message of its own right behind it. Carrying the text on the photos
+        makes those two messages one. Whatever a group could not carry (every
+        item in it was dropped) comes back in `report.unused_captions`.
         """
         report = SendReport()
-        pending_caption: str | None = caption or None
+        followup = [piece for piece in (followup_captions or []) if piece]
         groups = list(chunk(items))
         total = part_total if part_total is not None else len(groups)
 
@@ -369,6 +381,8 @@ class MediaSender:
             position = part_from + offset
             # A split album reads as one post: every part is marked, and each
             # part replies to the one before it so Telegram threads them.
+            group_caption = caption if offset == 0 else (followup.pop(0) if followup else "")
+            pending_caption = group_caption or None
             if total > 1:
                 marker = f"[{position}/{total}]"
                 pending_caption = f"{marker} {pending_caption}" if pending_caption else marker
@@ -451,10 +465,14 @@ class MediaSender:
                 report.sent += len(media)
                 report.uploaded = report.uploaded or bool(files)
                 break
-            pending_caption = None
+            if result is None and offset > 0 and group_caption:
+                # The group never went out — every item in it was dropped — so
+                # the text it was to carry must not go down with the photos.
+                followup.insert(0, group_caption)
             reply_to = (first_message_id(result) if result else None) or reply_to
             if total > 1:
                 await asyncio.sleep(1)  # be gentle with album rate limits
+        report.unused_captions = followup
         return report
 
     async def _send_group(

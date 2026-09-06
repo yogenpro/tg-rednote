@@ -11,7 +11,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "bot"))
 
 from app.config import Config  # noqa: E402
 from app.handlers import Bot, message_candidates  # noqa: E402
-from app.media import SendReport  # noqa: E402
+from app.media import MEDIA_GROUP_LIMIT, SendReport  # noqa: E402
 from app.state import State  # noqa: E402
 from app.telegram import TelegramError  # noqa: E402
 from app.xhs import Note, XhsError  # noqa: E402
@@ -77,8 +77,11 @@ class FakeSender:
         self.streaming = False
         self.next_message_id = 1
 
-    async def send(self, chat_id, items, caption, *, reply_to=None, part_from=1, part_total=None):
-        self.sends.append((chat_id, list(items), caption, reply_to, part_from))
+    async def send(
+        self, chat_id, items, caption, *, reply_to=None, part_from=1, part_total=None,
+        followup_captions=None,
+    ):
+        self.sends.append((chat_id, list(items), caption, reply_to, part_from, list(followup_captions or [])))
         return SendReport(
             sent=len(items),
             first_message_id=self.next_message_id,
@@ -95,13 +98,53 @@ class FakeSender:
 class TickingSender(FakeSender):
     """Distinct message ids per send, as Telegram hands out."""
 
-    async def send(self, chat_id, items, caption, *, reply_to=None, part_from=1, part_total=None):
-        self.sends.append((chat_id, list(items), caption, reply_to, part_from))
+    async def send(
+        self, chat_id, items, caption, *, reply_to=None, part_from=1, part_total=None,
+        followup_captions=None,
+    ):
+        self.sends.append((chat_id, list(items), caption, reply_to, part_from, list(followup_captions or [])))
         mid = self.next_message_id
         self.next_message_id += 1
         return SendReport(
             sent=len(items), first_message_id=mid, parts=[(mid, caption)]
         )
+
+
+class ChunkingSender(FakeSender):
+    """Splits past ten items the way the real sender does, so a multi-group
+    album can be observed from the handler: markers, per-group captions, and
+    the group anchors the continuation chain is built from."""
+
+    def __init__(self):
+        super().__init__()
+        self.reports = []
+
+    async def send(
+        self, chat_id, items, caption, *, reply_to=None, part_from=1, part_total=None,
+        followup_captions=None,
+    ):
+        self.sends.append((chat_id, list(items), caption, reply_to, part_from, list(followup_captions or [])))
+        followup = list(followup_captions or [])
+        groups = [
+            items[i : i + MEDIA_GROUP_LIMIT] for i in range(0, len(items), MEDIA_GROUP_LIMIT)
+        ]
+        total = part_total if part_total is not None else len(groups)
+        parts = []
+        first = None
+        for offset, group in enumerate(groups):
+            head = caption if offset == 0 else (followup.pop(0) if followup else "")
+            if total > 1:
+                head = f"[{part_from + offset}/{total}] {head}".rstrip()
+            mid = self.next_message_id
+            self.next_message_id += max(1, len(group))
+            if first is None:
+                first = mid
+            parts.append((mid, head))
+        report = SendReport(
+            sent=len(items), first_message_id=first, parts=parts, unused_captions=followup
+        )
+        self.reports.append(report)
+        return report
 
 
 def make_bot(tmp_path, *, downloader=None, owner=None, **config_kwargs) -> tuple[Bot, FakeTelegram, State]:
@@ -543,7 +586,7 @@ async def test_comment_pictures_go_out_as_one_album_per_comment(tmp_path):
     await bot.handle_update(message("http://xhslink.com/o/x"))
 
     assert len(bot.sender.sends) == 3  # the note, then one album per comment
-    chat, items, caption, reply_to, _part = bot.sender.sends[0]
+    chat, items, caption, reply_to, _part, _follow = bot.sender.sends[0]
     assert [i.url for i in items] == ["https://cdn/1", "https://cdn/2"]
 
     first, second = bot.sender.sends[1], bot.sender.sends[2]
@@ -627,10 +670,16 @@ async def test_a_refused_comment_album_costs_its_pictures_not_the_note(tmp_path)
     )
 
     class RefusesTheSecondAlbum(TickingSender):
-        async def send(self, chat_id, items, caption, *, reply_to=None, part_from=1, part_total=None):
+        async def send(
+            self, chat_id, items, caption, *, reply_to=None, part_from=1, part_total=None,
+            followup_captions=None,
+        ):
             if len(self.sends) >= 1:  # the note album went out already
                 raise TelegramError("sendMediaGroup", 400, "Bad Request: WEBPAGE_CURL_FAILED")
-            return await super().send(chat_id, items, caption, reply_to=reply_to, part_from=part_from)
+            return await super().send(
+                chat_id, items, caption, reply_to=reply_to, part_from=part_from,
+                followup_captions=followup_captions,
+            )
 
     bot.sender = RefusesTheSecondAlbum()
     await bot.handle_update(message("http://xhslink.com/o/x"))
@@ -762,6 +811,107 @@ async def test_a_comment_too_long_for_the_caption_is_not_cut_and_dropped(tmp_pat
     assert "second" in follow_ups
 
 
+# ---- overflow text riding the photo overflow -------------------------
+
+
+def big_note(photos: int, desc: str) -> Note:
+    return Note(
+        note_id="6a8a",
+        kind="image",
+        title="标题",
+        desc=desc,
+        author="Someone",
+        url="https://www.xiaohongshu.com/explore/6a8a",
+        photos=[f"https://cdn/{i}" for i in range(photos)],
+        lives=[None] * photos,
+    )
+
+
+@pytest.mark.asyncio
+async def test_photo_overflow_carries_the_text_overflow(tmp_path):
+    """A split album with a long description used to cost three messages:
+    [1/2] with the caption head, [2/2] wearing nothing but its marker, and a
+    text message for the overflow right behind it — the middle message spent
+    on nothing. The overflow belongs on the photos that were already going
+    out. Seen live on /gradient_canopy/1137: 15 photos, [2/2] caption 18
+    units long, and a third message that would have fitted inside it."""
+    from app.comments import Comment
+
+    note = big_note(15, "尾" * 1800)  # overflows the caption, fits one carry budget
+    comments = [Comment("u1", "好吃", likes="3")]
+    bot, telegram, _ = make_bot(
+        tmp_path, downloader=FakeDownloader(note, comments=comments), owner=1
+    )
+    bot.sender = ChunkingSender()
+    await bot.handle_update(message("http://xhslink.com/o/x"))
+
+    assert len(bot.sender.sends) == 1  # the note album — no message after it
+    carry = bot.sender.sends[0][5]
+    assert len(carry) == 1
+    assert "尾" in carry[0]
+    assert "top comments" in carry[0]  # the comments rode the same caption
+    second = bot.sender.reports[0].parts[1][1]
+    assert second.startswith("[2/2] ")
+    assert "尾" in second and "top comments" in second
+    assert telegram.sent == []  # two messages, not three
+
+
+@pytest.mark.asyncio
+async def test_overflow_past_the_carry_budget_still_gets_its_message(tmp_path):
+    """A description too long for the carry caption is not lost: what the
+    photo-overflow group could not hold goes out as a message, as before."""
+    from app.comments import Comment
+
+    note = big_note(15, "尾" * 5000)
+    comments = [Comment("u1", "好吃", likes="3")]
+    bot, telegram, _ = make_bot(
+        tmp_path, downloader=FakeDownloader(note, comments=comments), owner=1
+    )
+    bot.sender = ChunkingSender()
+    await bot.handle_update(message("http://xhslink.com/o/x"))
+
+    second = bot.sender.reports[0].parts[1][1]
+    assert second.startswith("[2/2] ")
+    assert "尾" in second
+    assert len(telegram.sent) == 1  # only the remainder, not the whole overflow
+    assert "尾" in telegram.sent[0][1]
+    assert "top comments" in telegram.sent[0][1]  # comments ride the last piece
+
+
+@pytest.mark.asyncio
+async def test_a_split_album_with_no_overflow_carries_nothing(tmp_path):
+    """The [2/2] group only carries text when there is text to carry."""
+    bot, telegram, _ = make_bot(
+        tmp_path, downloader=FakeDownloader(big_note(15, "短描述")), owner=1
+    )
+    bot.sender = ChunkingSender()
+    await bot.handle_update(message("http://xhslink.com/o/x"))
+
+    assert bot.sender.sends[0][5] == []
+    assert bot.sender.reports[0].parts[1][1] == "[2/2]"
+    assert telegram.sent == []
+
+
+@pytest.mark.asyncio
+async def test_the_channel_links_across_a_carried_caption(tmp_path):
+    """In a channel the continues-link has to span the carried caption too:
+    [1/2] points at [2/2], which carries the text and points nowhere."""
+    note = big_note(15, "尾" * 1800)
+    bot, telegram, _ = channel_bot(tmp_path, downloader=FakeDownloader(note))
+    bot.sender = ChunkingSender()
+    bot.sender.next_message_id = 42
+    await bot.handle_update(message("http://xhslink.com/o/x"))
+
+    assert all(
+        chat != -1001234567890 for chat, _t in telegram.sent
+    )  # everything travelled on the two album groups
+    assert len(telegram.edits) == 1  # the first part; the last points nowhere
+    _chat, edited_id, body = telegram.edits[0]
+    assert edited_id == 42
+    assert "https://t.me/mychannel/52" in body  # [2/2]'s own permalink
+    assert "continues ↓" in body
+
+
 @pytest.mark.asyncio
 async def test_a_failed_comment_scrape_still_delivers_the_note(tmp_path):
     class Exploding(FakeDownloader):
@@ -863,7 +1013,10 @@ async def test_a_channel_refusal_tells_the_submitter_and_the_owner(tmp_path):
     class Refusing:
         sends = []
 
-        async def send(self, chat_id, items, caption, *, reply_to=None, part_from=1, part_total=None):
+        async def send(
+            self, chat_id, items, caption, *, reply_to=None, part_from=1, part_total=None,
+            followup_captions=None,
+        ):
             raise TelegramError("sendMediaGroup", 400, "Bad Request: not enough rights")
 
         async def aclose(self):
@@ -1266,8 +1419,11 @@ async def test_group_admin_commands_are_owner_only(tmp_path):
 class SkippingSender(FakeSender):
     """Everything was too large or unreachable: nothing left to post."""
 
-    async def send(self, chat_id, items, caption, *, reply_to=None, part_from=1, part_total=None):
-        self.sends.append((chat_id, list(items), caption, reply_to, part_from))
+    async def send(
+        self, chat_id, items, caption, *, reply_to=None, part_from=1, part_total=None,
+        followup_captions=None,
+    ):
+        self.sends.append((chat_id, list(items), caption, reply_to, part_from, list(followup_captions or [])))
         return SendReport(sent=0, skipped=["item 1 too large (88 MB)"], first_message_id=None)
 
 

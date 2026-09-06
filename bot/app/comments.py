@@ -21,7 +21,7 @@ from typing import Any
 
 import httpx
 
-from .media import tg_len, tg_truncate
+from .media import MEDIA_GROUP_LIMIT, tg_len, tg_truncate
 
 log = logging.getLogger(__name__)
 
@@ -46,7 +46,7 @@ class Comment:
     replying_to: str = ""
     # Pictures attached to this comment. They are delivered separately — an
     # album belongs to whoever wrote the post it captions — so the comment
-    # itself carries a marker linking to each one.
+    # itself carries one marker per Telegram-sized album.
     images: list[str] = field(default_factory=list)
     replies: list["Comment"] = field(default_factory=list)
 
@@ -157,15 +157,12 @@ def _render_one(comment: Comment, *, reply: bool, like: str = "♥") -> str:
     head = f"{bullet} <b>{who}</b>"
     if meta:
         head += f" <i>({escape(meta)})</i>"
-    for index, url in enumerate(comment.images, start=1):
-        # Markup and href targets are free against Telegram's limit, so the
-        # marker costs two units however long the URL is. The href is the
-        # full-size CDN image, which works anywhere; once the comment's own
-        # album has been sent, `relink_images` upgrades it to a link to that
-        # message — the send-then-edit trick the `continues ↓` chain uses,
-        # for the same reason: message ids are not predictable in advance.
-        label = "📷" if len(comment.images) == 1 else f"📷{index}"
-        head += f' <a href="{escape(url, quote=True)}">{label}</a>'
+    # One marker represents one Telegram-sized album, not one picture. Its
+    # href starts as the first full-size image in that album; once sent to a
+    # channel, `relink_images` upgrades it to the album's permalink. A set
+    # larger than one media group gets one marker per group.
+    for url in comment.images[::MEDIA_GROUP_LIMIT]:
+        head += f' <a href="{escape(url, quote=True)}">📷</a>'
     if comment.text:
         return f"{head}\n{escape(comment.text)}"
     return head
@@ -183,13 +180,13 @@ ALBUM_BUDGET = 10
 def comment_albums(
     comments: list[Comment], limit: int = ALBUM_BUDGET
 ) -> list[tuple[str, list[str]]]:
-    """One album per image-carrying comment: (caption, urls), in thread order.
+    """Telegram-sized albums for comment pictures: (caption, urls), in order.
 
     They travel separately from the note's own album for the same reason the
     forum's reply pictures do: an album's caption is the note author's, and
-    someone else's photo under it credits the wrong person. Delivered in
-    comment order after everything else, so the 📷 markers above map onto the
-    albums below.
+    someone else's photo under it credits the wrong person. A normal comment
+    yields one album; an unusually large set is split so each 📷 marker maps
+    to exactly one message. The shared budget still caps the total.
     """
     albums: list[tuple[str, list[str]]] = []
     remaining = limit
@@ -199,19 +196,21 @@ def comment_albums(
         urls = comment.images[:remaining]
         remaining -= len(urls)
         whose = f"{escape(comment.author)}'s" if comment.author else "a"
-        albums.append((f"📷 from {whose} comment", urls))
+        caption = f"📷 from {whose} comment"
+        for start in range(0, len(urls), MEDIA_GROUP_LIMIT):
+            albums.append((caption, urls[start : start + MEDIA_GROUP_LIMIT]))
     return albums
 
 
 def relink_images(html: str, links: dict[str, str]) -> str:
     """Point 📷 markers at the albums that were sent for them.
 
-    `links` maps a picture's CDN URL to the message that delivered it. Only
-    the marker anchors carry these URLs as hrefs — comment text is escaped
-    plain text and the note's own footer links elsewhere — so replacing the
-    href attribute is exact. A URL with no entry keeps its CDN href: that is
-    the marker of a picture past the album budget, or of a delivery with no
-    permalink (a DM has none), and the raw image is still one tap away.
+    `links` maps an album's lead picture URL to the message that delivered it.
+    Only the marker anchors carry these URLs as hrefs — comment text is
+    escaped plain text and the note's own footer links elsewhere — so replacing
+    the href attribute is exact. A URL with no entry keeps its CDN href: that
+    is a marker past the album budget, or one sent where no permalink exists
+    (a DM), and the raw image is still one tap away.
     """
     for url, target in links.items():
         html = html.replace(

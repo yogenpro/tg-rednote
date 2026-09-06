@@ -437,19 +437,31 @@ class Bot:
         return (sent or {}).get("message_id")
 
     async def _link_the_chain(
-        self, chat_id: int | str, chain: list[tuple[int, str, bool]]
+        self,
+        chat_id: int | str,
+        chain: list[tuple[int, str, bool]],
+        *,
+        image_links: dict[str, str] | None = None,
     ) -> None:
-        """Point every message at the next one.
+        """Finalize normal continuations and comment-picture marker links.
 
         Telegram's reply chain vanishes when a post is forwarded elsewhere, so
-        the pointer has to live in the message body. The room for it was
-        reserved when the caption was built.
+        normal text/media continuations need an in-body pointer. Comment-image
+        albums are deliberately not in that chain: they reply to the main post
+        (or its comment-overflow message) instead. If a channel permalink is
+        available, their 📷 markers are folded into the same edit as any normal
+        continuation, so a message is touched at most once.
         """
-        for (message_id, body, is_caption), (next_id, _, _) in zip(chain, chain[1:]):
-            link = self.message_link(next_id)
-            if not link:
+        for index, (message_id, original, is_caption) in enumerate(chain):
+            body = relink_images(original, image_links) if image_links else original
+            next_id = None
+            if index + 1 < len(chain):
+                next_id = chain[index + 1][0]
+                link = self.message_link(next_id)
+                if link:
+                    body = f'{body}\n\n<a href="{link}">{CONTINUED}</a>'
+            if body == original:
                 continue
-            body = f'{body}\n\n<a href="{link}">{CONTINUED}</a>'
             try:
                 if is_caption:
                     await self.tg.edit_message_caption(chat_id, message_id, body)
@@ -457,7 +469,10 @@ class Bot:
                     await self.tg.edit_message_text(chat_id, message_id, body)
             except TelegramError as exc:
                 log.warning(
-                    "could not link message %s to %s: %s", message_id, next_id, exc.description
+                    "could not finalize message %s%s: %s",
+                    message_id,
+                    f" to {next_id}" if next_id else "",
+                    exc.description,
                 )
 
     def message_link(self, message_id: int) -> str | None:
@@ -1312,20 +1327,39 @@ class Bot:
         caption, overflow = build_caption(
             note, tags=self.config.tags_in_caption, reserve=marker
         )
-        # A post with a continuation carries a link to it, and that link needs
-        # room the note text would otherwise use. Comments count here even
-        # though they often end up fitting in the caption: whether they do is
-        # only known after the caption is built, and 16 units is a cheaper
-        # price than rebuilding twice.
-        continues = bool(overflow or comments or parts > 1)
-        if channel and continues:
+        # Reserve room for `continues ↓` only when normal note/comment text
+        # actually continues. Comment-picture albums are replies to that text,
+        # not members of its continuation chain, so pictures alone do not spend
+        # caption room on a link they do not need.
+        continuation_reserved = bool(channel and parts > 1)
+        if continuation_reserved:
             caption, overflow = build_caption(
                 note, tags=self.config.tags_in_caption, reserve=marker + CONTINUED_COST
             )
         if overflow:
+            if channel and not continuation_reserved:
+                caption, overflow = build_caption(
+                    note, tags=self.config.tags_in_caption, reserve=marker + CONTINUED_COST
+                )
+                continuation_reserved = True
             trailing = comments
         else:
-            caption, trailing = fit_into_caption(caption, comments, limit=budget)
+            caption, trailing = fit_into_caption(
+                caption,
+                comments,
+                limit=budget - (CONTINUED_COST if continuation_reserved else 0),
+            )
+            if channel and trailing and not continuation_reserved:
+                caption, overflow = build_caption(
+                    note, tags=self.config.tags_in_caption, reserve=marker + CONTINUED_COST
+                )
+                continuation_reserved = True
+                if overflow:
+                    trailing = comments
+                else:
+                    caption, trailing = fit_into_caption(
+                        caption, comments, limit=budget - CONTINUED_COST
+                    )
 
         # Where the album goes: the channel if we're curating one, else back to
         # whoever asked. A channel post can't reply to a user's message.
@@ -1398,10 +1432,12 @@ class Bot:
                 chain.append((sent, piece, False))
                 previous = sent
 
-        # A comment's pictures, each set under its author's name. They come
-        # after everything else and reply to it, so they read as attached to
-        # the thread above rather than to the note. A refused or empty album
-        # costs its pictures, not the delivery — the note is already out.
+        # A comment's pictures, each set under its author's name. They all
+        # reply to the note itself — or to the message that carries comments
+        # after caption overflow — instead of forming an unrelated reply chain.
+        # A refused or empty album costs its pictures, not the delivery: the
+        # note is already out.
+        comment_parent = previous
         links: dict[str, str] = {}
         delivered = 0
         albums_sent = 0
@@ -1412,7 +1448,7 @@ class Bot:
                         target,
                         [MediaItem("photo", url) for url in urls],
                         caption,
-                        reply_to=previous,
+                        reply_to=comment_parent,
                     )
             except TelegramError as exc:
                 log.warning(
@@ -1427,16 +1463,12 @@ class Bot:
                 continue
             delivered += part.sent
             albums_sent += 1
-            previous = part.first_message_id or previous
-            chain.extend((mid, cap, True) for mid, cap in part.parts)
-            # The 📷 markers are upgraded to point here — but only where a
-            # permalink exists to point at, which for a bot means the channel;
-            # in a DM or a group the marker keeps the full-size CDN image,
-            # which is still one tap away, and the album sits right below.
+            # Each entry from comment_albums is one Telegram-sized group, so
+            # the marker for its lead image names precisely this album.
             if channel and part.first_message_id:
                 where = self.message_link(part.first_message_id)
                 if where:
-                    links.update({url: where for url in urls})
+                    links[urls[0]] = where
         if delivered:
             log.info(
                 "comment pictures for %s: %d photo(s) in %d album(s)",
@@ -1446,18 +1478,13 @@ class Bot:
                     images=delivered, albums=albums_sent,
                 ),
             )
-            # Rewrite the markers before the chain is linked, so each message
-            # is edited once for both.
-            if links:
-                chain = [
-                    (mid, relink_images(body, links), is_caption)
-                    for mid, body, is_caption in chain
-                ]
 
         # A reply chain is invisible once a message is forwarded out of the
-        # channel, so each message also carries a link to the next one.
-        if channel and len(chain) > 1:
-            await self._link_the_chain(target, chain)
+        # channel, so each normal message also carries a link to the next one.
+        # Comment-image albums rely on their reply parent instead; marker edits
+        # are folded into this pass without adding them to the chain.
+        if channel and (len(chain) > 1 or links):
+            await self._link_the_chain(target, chain, image_links=links)
 
         if report.skipped:
             await self._reply(chat_id, "Skipped: " + "; ".join(escape(s) for s in report.skipped))

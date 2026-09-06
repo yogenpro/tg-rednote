@@ -551,18 +551,19 @@ async def test_comment_pictures_go_out_as_one_album_per_comment(tmp_path):
     assert first[2] == "📷 from 虎牙's comment"
     assert [i.url for i in second[1]] == ["https://cdn/c3"]
     assert second[2] == "📷 from a comment"
-    # Each album replies to the message before it, so they read as attached.
-    assert first[3] == 1 and second[3] == 2
-    # No permalink exists in a DM, so the marker keeps the full-size image.
-    assert '<a href="https://cdn/c1">📷1</a>' in caption
-    assert '<a href="https://cdn/c2">📷2</a>' in caption
+    # Both albums answer the same note, rather than chaining off one another.
+    assert first[3] == second[3] == 1
+    # One marker represents the whole first album. In a DM it keeps the lead
+    # image URL because there is no channel permalink to upgrade it to.
+    assert '<a href="https://cdn/c1">📷</a>' in caption
+    assert 'href="https://cdn/c2"' not in caption
     assert telegram.edits == []
 
 
 @pytest.mark.asyncio
 async def test_channel_markers_are_relinked_to_the_comment_albums(tmp_path):
-    """Send first, edit after: once the albums exist, the 📷 markers point at
-    them, and the `continues ↓` chain threads through the albums too."""
+    """Send first, edit after: the one 📷 marker points at its album, while
+    the album's reply parent makes a `continues ↓` link unnecessary."""
     from app.comments import Comment
 
     comments = [Comment("虎牙", "好吃", images=["https://cdn/c1"])]
@@ -574,14 +575,46 @@ async def test_channel_markers_are_relinked_to_the_comment_albums(tmp_path):
 
     assert len(bot.sender.sends) == 2
     assert bot.sender.sends[1][3] == 1  # the album replies to the post
-    # One edit for the post's caption: the upgraded marker, and the chain
-    # link to the album that follows it.
+    # One edit upgrades the marker; comment-image albums do not join the
+    # normal continuation chain.
     assert len(telegram.edits) == 1
     chat_id, message_id, body = telegram.edits[0]
     assert (chat_id, message_id) == (-1001234567890, 1)
     assert '<a href="https://t.me/mychannel/2">📷</a>' in body
     assert 'href="https://cdn/c1"' not in body
-    assert "continues ↓" in body and "https://t.me/mychannel/2" in body
+    assert "continues ↓" not in body
+
+
+@pytest.mark.asyncio
+async def test_comment_picture_albums_reply_to_comment_overflow(tmp_path):
+    """When comments move out of a full caption, every picture album hangs
+    from that one comment message rather than from the preceding album."""
+    from app.comments import Comment
+
+    note = Note(
+        note_id="650a",
+        kind="image",
+        title="T" * 300,
+        desc="D" * 700,
+        author="Someone",
+        url="https://www.xiaohongshu.com/explore/650a",
+        photos=["https://cdn/1", "https://cdn/2"],
+        lives=[None, None],
+    )
+    comments = [
+        Comment("虎牙", "好吃", images=["https://cdn/c1"]),
+        Comment("路人", "我也是", images=["https://cdn/c2"]),
+    ]
+    bot, telegram, _ = make_bot(
+        tmp_path, downloader=FakeDownloader(note, comments=comments), owner=1
+    )
+    bot.sender = TickingSender()
+    await bot.handle_update(message("http://xhslink.com/o/x"))
+
+    assert telegram.sent and "top comments" in telegram.sent[0][1]
+    galleries = bot.sender.sends[1:]
+    assert len(galleries) == 2
+    assert [gallery[3] for gallery in galleries] == [901, 901]
 
 
 @pytest.mark.asyncio

@@ -141,23 +141,25 @@ real comment — on purchase-showcase notes it is often the whole point — so t
 "keep if text or pictures". (An empty comment with *no* pictures is still dropped with its
 replies; that shape exists too and is in TODO.)
 
-**Comment pictures go out as one album per comment, and the marker is relinked after.**
+**Comment pictures go out as one album per comment, with one marker per album.**
 They never join the note's own album — an album's caption is the author's, the same mistake
 the forum path guards against — but travel after everything else, each set captioned
-`📷 from <author>'s comment` and replying to the message before it, in comment order, under a
-shared budget of ten photos. The 📷 marker in the comment text starts as a link to the
-full-size CDN image, then — once the albums exist — is upgraded by *editing* the carrying
-message to point at the album's permalink: send-then-edit, the same trick `continues ↓` uses,
-for the same reason (message ids are not predictable), and folded into the same edit so each
-message is touched once. Only the channel has permalinks to point at; in a DM the marker keeps
-the CDN href, which is still one tap away. The relink rewrites the exact `href="…"` attribute,
-which only the marker anchors carry — comment text is escaped plain text, so an incidental
-match cannot happen. One more trap in the neighbourhood: the truncation path of
-`render_comments` rebuilds the comment it shortens, and a rebuild that forgot `images` both
-lost the markers and unbudgeted their two units each — a markered comment could overflow the
-limit Telegram enforces. The comment-picture CDN is a family of its own
-(`sns-img-qc.xhscdn.com/comment`) that Telegram's fetcher has not yet been seen to accept or
-refuse; `auto` mode learns it either way, same as the note families.
+`📷 from <author>'s comment`, under a shared budget of ten photos. A 📷 marker stands for a
+whole Telegram-sized album, not an individual picture: it starts as a link to that album's
+lead full-size CDN image, then — once the album exists in a channel — is upgraded by *editing*
+the carrying message to point at the album permalink. Large sets therefore get one marker per
+media group. Every comment-picture album replies to the note's main album, or to the last
+message carrying comment overflow, rather than to the preceding picture album; because that
+reply parent is sufficient, picture albums never enter the `continues ↓` chain. When a normal
+continuation edit is needed, the marker rewrite is folded into it so a message is touched once.
+Only the channel has permalinks to point at; in a DM the marker keeps the CDN href, which is
+still one tap away. The relink rewrites the exact `href="…"` attribute, which only the marker
+anchors carry — comment text is escaped plain text, so an incidental match cannot happen. One
+more trap in the neighbourhood: the truncation path of `render_comments` rebuilds the comment
+it shortens, and a rebuild that forgot `images` both lost the markers and unbudgeted their two
+units each — a markered comment could overflow the limit Telegram enforces. The comment-picture
+CDN is a family of its own (`sns-img-qc.xhscdn.com/comment`) that Telegram's fetcher has not yet
+been seen to accept or refuse; `auto` mode learns it either way, same as the note families.
 
 **Caption priority order**: the note's text first, comments only with what's left. If the text
 overflows at all, comments move to the follow-up message entirely (and ride inside the last

@@ -994,12 +994,33 @@ def test_comment_albums_group_per_comment_with_a_shared_budget():
         ("📷 from 丁 &lt;ev&amp;il&gt;'s comment", ["https://cdn/d1"]),
     ]
     # The budget is shared: once ten pictures have gone out, later comments
-    # keep only their 📷 markers, and a long set is cut not dropped whole.
+    # are not delivered and a long set is cut rather than dropped whole.
     many = [Comment(f"u{i}", "t", images=[f"https://cdn/{i}-1", f"https://cdn/{i}-2"])
             for i in range(8)]
     capped = comment_albums(many)
     assert sum(len(urls) for _c, urls in capped) == 10
     assert capped[-1][1] == ["https://cdn/4-1", "https://cdn/4-2"]
+
+    # If the caller has a larger budget, one large comment is split at
+    # Telegram's media-group boundary so every marker has one target album.
+    split = comment_albums(
+        [Comment("甲", "text", images=[f"https://cdn/{i}" for i in range(12)])], limit=12
+    )
+    assert [len(urls) for _caption, urls in split] == [10, 2]
+
+
+def test_comment_markers_follow_album_boundaries():
+    from app.comments import Comment, render_comments
+
+    urls = [f"https://cdn/{i}" for i in range(12)]
+    block = render_comments([Comment("甲", "look", images=urls)], limit=4000)
+
+    # Two pictures still need only one marker; the twelfth starts a second
+    # Telegram-sized album and earns the second marker.
+    assert block.count("📷") == 2
+    assert '<a href="https://cdn/0">📷</a>' in block
+    assert '<a href="https://cdn/10">📷</a>' in block
+    assert 'href="https://cdn/1"' not in block
 
 
 def test_relink_images_upgrades_markers_and_leaves_the_rest_alone():
@@ -1036,8 +1057,8 @@ def test_a_truncated_first_comment_keeps_its_markers_within_budget():
     block = render_comments(comments, limit=400)
 
     assert 0 < tg_len(visible(block)) <= 400
-    assert '<a href="https://cdn/p1">📷1</a>' in block
-    assert '<a href="https://cdn/p2">📷2</a>' in block
+    assert '<a href="https://cdn/p1">📷</a>' in block
+    assert 'href="https://cdn/p2"' not in block
     assert block.endswith("…")
 
 

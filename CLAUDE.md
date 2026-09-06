@@ -166,6 +166,19 @@ overflows at all, comments move to the follow-up message entirely (and ride insi
 text chunk, so an overflowing note costs two messages, not three). An earlier version reserved
 caption room for comments up front and pushed descriptions into a second message needlessly.
 
+**A split album's overflow parts carry the text overflow.** An album past ten items pays for a
+message per extra part, and Telegram hands each part a caption it would otherwise wear nothing
+but its `[2/2]` marker on — 18 units on a 5-photo group, seen live on /gradient_canopy/1137,
+with the description overflow in a message right behind it that would have fitted inside it
+many times over. So `MediaSender.send` takes `followup_captions`, filled in order by the
+groups after the first, and `_follow_up` sizes its first pieces to those groups' caption
+budgets (`CAPTION_LIMIT - marker - continues`) instead of the 4096 message limit — the overflow
+flows into the captions, and only what won't fit becomes a message. A part whose every item is
+dropped hands its text back via `report.unused_captions` rather than going down with the
+photos. One consequence for the reply chain: the follow-up text now replies to the *last* part
+of the album (it continues that part's caption), and comment-picture albums reply to whatever
+message ended up carrying the comments — the last part included.
+
 **Comments in the caption are all or none, and that is the fix for a real silent loss.**
 `fit_into_caption` returns `(caption, leftover)`; it used to return just the caption, appending
 whatever fitted and truncating the first comment mid-sentence to do it. The caller could only

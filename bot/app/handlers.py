@@ -9,6 +9,7 @@ import logging
 import time
 from datetime import datetime, timezone
 from html import escape
+from typing import Sequence
 
 from .acres import (
     Acres,
@@ -34,7 +35,7 @@ from .comments import (
     render_comments,
     strip_tags,
 )
-from .media import MEDIA_GROUP_LIMIT, MediaSender, build_caption, split_message, tg_len
+from .media import MEDIA_GROUP_LIMIT, MediaSender, build_caption, tg_len, tg_truncate
 from .state import State, generate_pairing_code
 from .telegraph import Telegraph, TelegraphError, trim
 from .telegram import CAPTION_LIMIT, MESSAGE_LIMIT, Telegram, TelegramError
@@ -1368,10 +1369,28 @@ class Bot:
             return
         reply_to = None if channel else message_id
 
+        # The follow-up text: the note's overflow, then comments. When the
+        # album itself splits, the groups after the first are captions in
+        # search of text — a photo-overflow group carrying only its "[2/2]"
+        # marker is a message spent on nothing — so the overflow flows into
+        # those captions first and only what is left becomes a message.
+        # (Seen live on a 15-photo note: /gradient_canopy/1137 sent [2/2] with
+        # an 18-unit caption and then a third message for the overflow.)
+        carry_budgets = (
+            [CAPTION_LIMIT - marker - (CONTINUED_COST if channel else 0)] * (parts - 1)
+            if parts > 1
+            else []
+        )
+        room = MESSAGE_LIMIT - (CONTINUED_COST if channel else 0)
+        pieces = self._follow_up(overflow, trailing, budgets=carry_budgets, limit=room)
+        carry = pieces[: len(carry_budgets)]
+
         action = "upload_video" if any(item.kind == "video" for item in items) else "upload_photo"
         try:
             async with self._busy(chat_id, action) if chat_id else _nothing():
-                report = await self.sender.send(target, items, caption, reply_to=reply_to)
+                report = await self.sender.send(
+                    target, items, caption, reply_to=reply_to, followup_captions=carry
+                )
         except TelegramError as exc:
             log.exception("send failed for note %s", note.note_id)
             await self._reply(
@@ -1422,11 +1441,12 @@ class Bot:
                 reply_to=message_id,
             )
             return
-        # Everything else follows in the same chat, chained onto the post.
+        # Everything else follows in the same chat, chained onto the post —
+        # text the album's captions could not carry (a dropped group hands
+        # its share back unused) plus whatever never fit in a caption.
         chain: list[tuple[int, str, bool]] = [(mid, cap, True) for mid, cap in report.parts]
-        previous = report.first_message_id
-        room = MESSAGE_LIMIT - (CONTINUED_COST if channel else 0)
-        for piece in self._follow_up(overflow, trailing, limit=room):
+        previous = report.parts[-1][0] if report.parts else report.first_message_id
+        for piece in report.unused_captions + pieces[len(carry) :]:
             sent = await self._send_and_track(target, piece, reply_to=previous)
             if sent:
                 chain.append((sent, piece, False))
@@ -1497,26 +1517,51 @@ class Bot:
 
     @staticmethod
     def _follow_up(
-        overflow: str, comments: list, *, limit: int = MESSAGE_LIMIT, like: str = "♥"
+        overflow: str,
+        comments: list,
+        *,
+        budgets: Sequence[int] = (),
+        limit: int = MESSAGE_LIMIT,
+        like: str = "♥",
     ) -> list[str]:
         """Messages to send after the album: the rest of the text, then comments.
 
-        The comments ride in the *last* text message when they fit, so a note
+        The comments ride in the *last* piece when they fit, so a note
         that needed a second message doesn't also need a third.
+
+        `budgets` are piece sizes that come ahead of the usual `limit` run:
+        the caption budgets of an album's overflow groups, which carry text
+        the group was going to waste on a "[2/2]" marker of its own. The
+        overflow fills them in order, and whatever spills past — or arrives
+        with none — is split at `limit` as before.
         """
-        pieces = [escape(piece) for piece in split_message(overflow, limit)] if overflow else []
-        if not comments:
-            return pieces
-        if pieces:
-            room = limit - tg_len(strip_tags(pieces[-1])) - 2
-            block = render_comments(comments, limit=room, like=like)
-            if block:
-                pieces[-1] = f"{pieces[-1]}\n\n{block}"
-                return pieces
-        block = render_comments(comments, limit=limit - 16, like=like)
-        if block:
-            pieces.append(block)
-        return pieces
+        pieces: list[tuple[str, int]] = []  # (html, the budget it was sized to)
+        remaining = overflow
+        for budget in budgets:
+            if not remaining:
+                break
+            head, remaining = tg_truncate(remaining, budget)
+            if head:
+                pieces.append((escape(head), budget))
+        while remaining:
+            head, remaining = tg_truncate(remaining, limit)
+            if not head:  # pathological single token longer than the limit
+                head, remaining = remaining[:limit], remaining[limit:]
+            pieces.append((escape(head), limit))
+        if comments:
+            if pieces:
+                body, budget = pieces[-1]
+                room = budget - tg_len(strip_tags(body)) - 2
+                block = render_comments(comments, limit=room, like=like)
+                if block:
+                    pieces[-1] = (f"{body}\n\n{block}", budget)
+                    comments = []
+            if comments:  # nothing to ride, or no room left in what there was
+                budget = budgets[len(pieces)] if len(pieces) < len(budgets) else limit
+                block = render_comments(comments, limit=budget - 16, like=like)
+                if block:
+                    pieces.append((block, budget))
+        return [html for html, _budget in pieces]
 
     async def _announce_published(
         self,

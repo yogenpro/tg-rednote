@@ -546,6 +546,73 @@ async def test_sender_uses_urls_when_telegram_accepts_them():
 
 
 @pytest.mark.asyncio
+async def test_photo_overflow_groups_carry_the_follow_up_text():
+    """A group past the first would otherwise wear nothing but its "[2/2]"
+    marker — a caption Telegram gives it for free — while the text it belongs
+    with goes out as a message right behind it. The overflow rides the photos
+    instead, and both groups keep their markers."""
+    telegram = FakeTelegram(fail_urls=False)
+    sender = MediaSender(telegram, mode="auto")
+    items = [MediaItem("photo", f"https://cdn/{i}") for i in range(15)]
+    report = await sender.send(1, items, "the caption", followup_captions=["the overflow"])
+    await sender.aclose()
+
+    assert report.sent == 15
+    assert len(telegram.calls) == 2
+    first, second = telegram.calls
+    assert first[1]["media"][0]["caption"].startswith("[1/2] the caption")
+    assert second[1]["media"][0]["caption"] == "[2/2] the overflow"
+    assert report.parts == [(1, "[1/2] the caption"), (11, "[2/2] the overflow")]
+    assert report.unused_captions == []
+
+
+class EvaporatingGroupTelegram:
+    """Every item of the second group is rejected by Telegram itself (bad
+    bytes, not a bad fetch — streaming can never fix it), so the group
+    vanishes item by item and its caption is never sent."""
+
+    def __init__(self):
+        self.calls = 0
+        self.next_id = 0
+
+    async def call(self, method, payload=None, files=None, timeout=None, retries=3):
+        self.calls += 1
+        if self.calls > 1:  # the first group went out; this one never will
+            raise TelegramError(
+                method, 400,
+                'Bad Request: failed to send message #1 with the error message '
+                '"PHOTO_INVALID_DIMENSIONS"',
+            )
+        count = len(payload.get("media", []))
+        result = []
+        for i in range(count):
+            self.next_id += 1
+            result.append({"message_id": self.next_id, "photo": [{"file_id": f"fid{i}"}]})
+        return result
+
+
+@pytest.mark.asyncio
+async def test_a_vanished_group_hands_its_caption_back(monkeypatch):
+    """The text a dropped group was to carry must not go down with the
+    photos: it comes back in `unused_captions` for the caller to send."""
+    telegram = EvaporatingGroupTelegram()
+    sender = MediaSender(telegram, mode="auto")
+
+    async def fake_download(url):
+        return b"bytes", "image/jpeg", url
+
+    monkeypatch.setattr(sender, "_download", fake_download)
+    items = [MediaItem("photo", f"https://cdn/{i}") for i in range(15)]
+    report = await sender.send(1, items, "the caption", followup_captions=["the overflow"])
+    await sender.aclose()
+
+    assert report.sent == 10  # only the first group made it
+    assert [mid for mid, _cap in report.parts] == [1]
+    assert report.unused_captions == ["the overflow"]
+    assert any("rejected by Telegram" in reason for reason in report.skipped)
+
+
+@pytest.mark.asyncio
 async def test_sender_falls_back_to_streaming(monkeypatch):
     telegram = FakeTelegram(fail_urls=True)
     sender = MediaSender(telegram, mode="auto")

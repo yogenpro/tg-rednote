@@ -647,7 +647,7 @@ async def test_images_ride_in_an_album_with_the_text_as_its_caption(tmp_path):
     thread = Thread(tid="9", url="u", title="T", body="b", images=["https://oss/1", "https://oss/2"])
     bot, telegram, _state = acres_bot(tmp_path, thread=thread)
     await bot.handle_update(message(LINK))
-    (chat, items, caption, _reply, _part) = bot.acres_sender.sends[0]
+    (chat, items, caption, _reply, _part, _follow) = bot.acres_sender.sends[0]
     assert chat == 1 and len(items) == 2 and "T" in caption
 
 
@@ -659,7 +659,7 @@ async def test_reply_pictures_travel_in_their_own_album_under_their_own_name(tmp
     )
     bot, telegram, _state = acres_bot(tmp_path, thread=thread)
     await bot.handle_update(message(LINK))
-    (_chat, items, caption, reply_to, _part) = bot.acres_sender.sends[0]
+    (_chat, items, caption, reply_to, _part, _follow) = bot.acres_sender.sends[0]
     assert [item.url for item in items] == ["https://oss/a.jpg"]
     assert "phase" in caption
     # Hung off the message it belongs under rather than sent adrift.

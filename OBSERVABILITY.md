@@ -45,6 +45,7 @@ a single note's whole journey comes out with one filter — which is the differe
 | `cdn_refused` | Telegram wouldn't fetch a URL | `families`, `recognised` |
 | `renditions` | Video renditions the page listed | `count` |
 | `rendition_swapped` | Oversized video downgraded | `megabytes` |
+| `photo_resized` | Photo over Telegram's dimension budget delivered as an imageView2 rendition | `original`, `resized`, `width` |
 | `page_walled` | The note page answered 200 with a wall behind it | `host` |
 | `sibling_domain` | The other domain served a page this one refused | `host` |
 | `page_unavailable` | Neither domain served the page | `note` |

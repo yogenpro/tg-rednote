@@ -97,6 +97,14 @@ notes (images, Ultra-HDR albums, videos, forwarded messages, `.com` and `.cn` li
 
 ## Recently done (context for the above)
 
+- Photo dimension budget, live 2026-09-11: a 12-image note of 4672×7008 camera photos
+  (`6aa2df2c…`) published nothing — Telegram refuses any photo whose width+height exceeds
+  10000, and the drop ladder ended on a bare `sendPhoto` that names no item, aborting the
+  send with the other groups unattempted. Now: an oversized photo is re-fetched through the
+  CDN's own imageView2 resize param at the largest deliverable size (verified live on the
+  `ci.xiaohongshu.com/spectrum` family), and a lone dimension-failing `sendPhoto` drops its
+  one item instead of raising. `photo_resized` event; the note itself delivers all twelve.
+
 - 1point3acres, confirmed live on 2026-08-21: a real thread (1186859) fetched with the
   owner's browser session and delivered in 1.3s — 4462 characters, correct title, author,
   forum and date, no jammer leakage. The first fetch also turned up a false positive:

@@ -189,6 +189,64 @@ def media_family(url: str) -> str:
     return f"{parts.netloc}/{directory}" if directory else parts.netloc
 
 
+# Telegram refuses a photo whose width and height together exceed 10000
+# (PHOTO_INVALID_DIMENSIONS; documented as "The photo's width and height must
+# not exceed 10000 in total"), and XHS's spectrum CDN serves full-resolution
+# camera photos that violate it — 4672x7008, total 11680, on every image of a
+# note seen live. The CDN honours Qiniu-style imageView2 resize params, so the
+# bytes can be swapped for a same-ratio rendition that fits.
+PHOTO_MAX_EDGE_SUM = 10000
+# Aim just under the limit: the CDN rounds the paired side, and a resize that
+# landed back over the line would be refused all over again.
+PHOTO_RESIZE_HEADROOM = 0.99
+
+
+def photo_dimensions(payload: bytes) -> tuple[int, int] | None:
+    """(width, height) of JPEG or PNG bytes, or None when it cannot be told.
+
+    Read from bytes already fetched for upload, so the dimension check costs
+    no request on the happy path. Only JPEG and PNG are recognised — the
+    shapes XHS serves photos in — and anything else reads as unknown, which
+    delivers exactly as before.
+    """
+    if payload[:3] == b"\xff\xd8\xff":
+        i, n = 2, len(payload)
+        while i + 9 < n:
+            if payload[i] != 0xFF:
+                i += 1
+                continue
+            marker = payload[i + 1]
+            if marker in (0x00, 0x01, 0xFF) or 0xD0 <= marker <= 0xD7:
+                i += 2  # fill/standalone markers carry no length
+                continue
+            if marker in (0xD9, 0xDA):  # EOI, start of scan — no SOF after this
+                return None
+            segment = int.from_bytes(payload[i + 2 : i + 4], "big")
+            if 0xC0 <= marker <= 0xCF and marker not in (0xC4, 0xC8, 0xCC):
+                height = int.from_bytes(payload[i + 5 : i + 7], "big")
+                width = int.from_bytes(payload[i + 7 : i + 9], "big")
+                return width, height
+            i += 2 + segment
+        return None
+    if payload[:8] == b"\x89PNG\r\n\x1a\n" and payload[12:16] == b"IHDR":
+        width = int.from_bytes(payload[16:20], "big")
+        height = int.from_bytes(payload[20:24], "big")
+        return width, height
+    return None
+
+
+def with_resize_param(url: str, width: int) -> str:
+    """The same image rendered `width` pixels wide, per the CDN's resize API.
+
+    Qiniu-style imageView2 — verified live against ci.xiaohongshu.com/spectrum,
+    which answered ?imageView2/2/w/4000 with 4000x6000 for a 4672x7008
+    original. The slashes stay raw: URL-encoding the path makes the CDN
+    ignore the parameter and serve the original.
+    """
+    sep = "&" if "?" in url else "?"
+    return f"{url}{sep}imageView2/2/w/{width}"
+
+
 class MediaSender:
     def __init__(
         self,
@@ -287,6 +345,52 @@ class MediaSender:
             f"({len(item.alternatives)} known)"
         )
 
+    async def _fit_photo(self, item: MediaItem, payload: bytes, content_type: str) -> tuple[bytes, str]:
+        """Swap a CDN-resized rendition in when a photo is too big for Telegram.
+
+        The byte budget says nothing about dimensions, and Telegram refuses a
+        photo whose width and height together exceed PHOTO_MAX_EDGE_SUM —
+        the bytes themselves, which no fetch and no retry ladder can fix. The
+        check reads the headers of bytes already in hand; when it fails, the
+        same CDN serves a same-ratio rendition at the largest deliverable
+        size, which beats dropping the photo — or, on a 12-image note where
+        every shot is full resolution, the whole album. A ratio Telegram also
+        refuses (>20) survives the resize unchanged and is rejected as before;
+        resizing cannot fix a ratio.
+        """
+        dims = photo_dimensions(payload)
+        if dims is None or dims[0] + dims[1] <= PHOTO_MAX_EDGE_SUM:
+            return payload, content_type
+        width, height = dims
+        target = int(PHOTO_MAX_EDGE_SUM * width / (width + height) * PHOTO_RESIZE_HEADROOM)
+        if target < 1:
+            raise MediaTooLarge(f"{width}x{height} exceeds Telegram's photo budget")
+        try:
+            payload, content_type, _u = await self._download(with_resize_param(item.url, target))
+        except (MediaTooLarge, httpx.HTTPError) as exc:
+            raise MediaTooLarge(
+                f"{width}x{height} exceeds Telegram's photo budget and the resized fetch "
+                f"failed ({type(exc).__name__})"
+            ) from exc
+        new_dims = photo_dimensions(payload)
+        if new_dims is None or new_dims[0] + new_dims[1] > PHOTO_MAX_EDGE_SUM:
+            raise MediaTooLarge(f"{width}x{height} exceeds Telegram's photo budget even resized")
+        log.info(
+            "photo %s came %dx%d; delivering the %dx%d rendition instead",
+            item.url.split("?")[0],
+            width,
+            height,
+            new_dims[0],
+            new_dims[1],
+            extra=fields(
+                event="photo_resized",
+                original=f"{width}x{height}",
+                resized=f"{new_dims[0]}x{new_dims[1]}",
+                width=target,
+            ),
+        )
+        return payload, content_type
+
     def _naming(self, kind: str, content_type: str, index: int) -> tuple[str, str]:
         fallback_type, fallback_ext = DEFAULT_TYPES[kind]
         if not content_type or not content_type.startswith(kind.replace("photo", "image")):
@@ -314,6 +418,8 @@ class MediaSender:
             elif self._needs_upload(item.url):
                 try:
                     payload, content_type, _u = await self._fetch_within_budget(item)
+                    if item.kind == "photo":
+                        payload, content_type = await self._fit_photo(item, payload, content_type)
                 except MediaTooLarge as exc:
                     skipped.append(f"item {index + 1} too large ({exc})")
                     continue
@@ -409,6 +515,16 @@ class MediaSender:
                         if str(entry.get("media", "")).startswith("http")
                     ]
                     culprit = exc.failed_index
+                    # A lone sendPhoto names no "message #N" — with one item
+                    # sent, a dimension failure is about that item by
+                    # elimination, and without a culprit both branches below
+                    # come up empty and `raise` sinks the send plus every group
+                    # of the album behind it. Seen live as the ninth
+                    # PHOTO_INVALID_DIMENSIONS on note 6aa2df2c…, after nine
+                    # drops had left a single photo. Scoped to that spelling:
+                    # other 400s no upload can fix must still surface.
+                    if culprit is None and len(media) == 1 and exc.is_dimension_failure:
+                        culprit = 1
                     in_range = culprit is not None and culprit <= len(sources)
                     # A culprit outside the range we sent isn't trustworthy as a
                     # pointer (Telegram's numbering has been seen not to line up

@@ -66,6 +66,20 @@ class TelegramError(RuntimeError):
         lowered = self.description.lower()
         return self.error_code == 400 and any(p in lowered for p in URL_FETCH_FAILURES)
 
+    @property
+    def is_dimension_failure(self) -> bool:
+        """The bytes themselves are the wrong shape for a photo.
+
+        PHOTO_INVALID_DIMENSIONS is Telegram's documented refusal of a photo
+        whose width and height together exceed 10000. Inside an album it comes
+        with a "message #N" to read the culprit from; a lone sendPhoto returns
+        it bare, and there the one item sent is the culprit by elimination.
+        Scoped to this one spelling on purpose: a 400 that no upload can fix
+        (chat not found, a caption that fits nowhere) has to surface, not be
+        eaten by the drop-and-continue ladder.
+        """
+        return self.error_code == 400 and "photo_invalid_dimensions" in self.description.lower()
+
 
 class Telegram:
     def __init__(self, token: str, api_base: str = "https://api.telegram.org", timeout: float = 60.0):

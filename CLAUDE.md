@@ -91,6 +91,26 @@ upload-mode (nothing fresh — the retry already happened and failed again): onl
 drops just that item from the group and keeps going. `report.skipped` picks it up same as an
 oversized video, so the caller's existing "Skipped: …" reply needed no changes.
 
+**Photos have a dimension budget, and XHS now serves photos that break it.** Telegram refuses
+any photo whose width and height together exceed 10000 — `PHOTO_INVALID_DIMENSIONS`,
+documented, the bytes themselves — and a note on 2026-09-11 (`6aa2df2c…`) was twelve photos of
+4672×7008 (total 11680, straight off a camera): every item undeliverable, one at a time, and
+the byte budget never notices. Two things now stand between such a note and an empty post.
+`MediaSender._fit_photo` reads the JPEG/PNG header of bytes already fetched for upload and,
+when they are over budget, re-fetches the same URL with `?imageView2/2/w=<target>` — the
+spectrum CDN honours Qiniu-style resize params (verified live: `w/4000` on a 4672×7008
+original answers 4000×6000, total exactly 10000), and the target takes 1% headroom so the
+CDN's rounding of the paired side cannot land back over the line. The check costs no request
+on the happy path; an oversized photo costs exactly one extra fetch. The same CDN serves those
+URLs as `application/octet-stream` as often as `image/jpeg`, which is presumably why the family
+fails URL-mode fetches in the first place. Separately: once the drop ladder has eaten a group
+down to one item, the bare `sendPhoto` failure names no `message #N`, so nothing was in range
+and the whole send aborted — nine drops, then `raise`, and the album's later groups never even
+attempted. Culprit-by-elimination now covers that case, but scoped to the dimension spelling
+(`TelegramError.is_dimension_failure`): a 400 no upload can fix (`chat not found`, a caption
+that fits nowhere) has to surface, not be eaten item by item. A ratio over Telegram's 20 limit
+survives the resize unchanged and is refused as before — resizing cannot fix a ratio.
+
 **XHS has three wall shapes, and two of them answer HTTP 200.** `/website-login/error?redirectPath=…`
 is the login wall; `/404/sec_<token>?source=xhs_sec_server&originalUrl=…` is its bot check, and
 rednote.com spells the same check `/404?source=/404/sec_<token>?redirectPath=…` — note the

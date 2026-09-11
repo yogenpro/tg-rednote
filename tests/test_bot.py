@@ -21,9 +21,11 @@ from app.media import (  # noqa: E402
     MediaTooLarge,
     build_caption,
     chunk,
+    photo_dimensions,
     split_message,
     tg_len,
     tg_truncate,
+    with_resize_param,
 )
 from app.state import State  # noqa: E402
 from app.telegram import CAPTION_LIMIT, TelegramError  # noqa: E402
@@ -712,6 +714,207 @@ async def test_auto_mode_drops_item_that_fails_even_after_streaming(monkeypatch)
     assert len(report.skipped) == 1
     assert "item 2" in report.skipped[0]
     assert "PHOTO_INVALID_DIMENSIONS" in report.skipped[0]
+
+
+# ---- photo dimension budget -------------------------------------------
+
+
+def _jpeg(width: int, height: int, *, progressive: bool = False) -> bytes:
+    """A minimal JPEG whose SOF segment carries these dimensions."""
+    sof_marker = b"\xc2" if progressive else b"\xc0"
+    sof = (
+        b"\xff" + sof_marker + (17).to_bytes(2, "big")
+        + bytes([8]) + height.to_bytes(2, "big") + width.to_bytes(2, "big")
+        + bytes([3]) + b"\x00" * 9
+    )
+    body = b""
+    if progressive:
+        # DHT tables routinely precede the SOF in progressive files.
+        # Length 4 = the two length bytes plus two bytes of table data.
+        body = b"\xff\xc4" + (4).to_bytes(2, "big") + b"\x00\x00"
+    return b"\xff\xd8" + body + sof + b"\xff\xd9"
+
+
+def test_photo_dimensions_reads_jpeg_and_png_headers():
+    assert photo_dimensions(_jpeg(4672, 7008)) == (4672, 7008)
+    # A DHT segment before the SOF must be skipped, not mistaken for it.
+    assert photo_dimensions(_jpeg(4657, 6985, progressive=True)) == (4657, 6985)
+    png = (
+        b"\x89PNG\r\n\x1a\n" + b"\x00\x00\x00\rIHDR"
+        + (4672).to_bytes(4, "big") + (7008).to_bytes(4, "big") + b"\x08\x06\x00\x00\x00"
+    )
+    assert photo_dimensions(png) == (4672, 7008)
+    # Unknown shapes read as unknown — the caller delivers them as before.
+    assert photo_dimensions(b"GIF89a" + b"\x00" * 20) is None
+    assert photo_dimensions(b"") is None
+    assert photo_dimensions(b"\xff\xd8\xff" + b"\xda" + b"\x00\x02") is None  # scan, no SOF
+
+
+def test_with_resize_param_joins_qiniu_style():
+    assert (
+        with_resize_param("https://ci.xiaohongshu.com/spectrum/abc", 3960)
+        == "https://ci.xiaohongshu.com/spectrum/abc?imageView2/2/w/3960"
+    )
+    assert (
+        with_resize_param("https://ci.xiaohongshu.com/spectrum/abc?token=t", 3960)
+        == "https://ci.xiaohongshu.com/spectrum/abc?token=t&imageView2/2/w/3960"
+    )
+
+
+@pytest.mark.asyncio
+async def test_auto_mode_swaps_in_resized_photo_over_dimension_budget(monkeypatch):
+    """Seen live on note 6aa2df2c…: a 12-image album of 4672x7008 photos —
+    width + height 11680 against Telegram's documented 10000 — rejected
+    PHOTO_INVALID_DIMENSIONS one by one until the note published nothing.
+    The spectrum CDN serves a same-ratio rendition on request."""
+
+    class ResizingTelegram:
+        """URL-mode sends fail, so the family is learned as refused and the
+        photo streams through — the shape the live oversized note took."""
+
+        def __init__(self):
+            self.files = {}
+
+        async def call(self, method, payload=None, files=None, timeout=None, retries=3):
+            if not files:
+                raise TelegramError(method, 400, 'Bad Request: WEBPAGE_CURL_FAILED')
+            self.files.update(files)
+            return {"message_id": 1, "photo": [{"file_id": "fid"}]}
+
+    telegram = ResizingTelegram()
+    sender = MediaSender(telegram, mode="auto")
+    fetched = []
+
+    async def fake_download(url):
+        fetched.append(url)
+        if "imageView2" in url:
+            return _jpeg(4000, 6000), "image/jpeg", url
+        return _jpeg(4672, 7008), "application/octet-stream", url
+
+    monkeypatch.setattr(sender, "_download", fake_download)
+    report = await sender.send(1, [MediaItem("photo", "https://ci.xiaohongshu.com/spectrum/big")], "cap")
+    await sender.aclose()
+
+    # The original was fetched, found oversized, and the rendition fetched
+    # behind it is what went up: 3960 = floor(10000 * 4672/11680 * 0.99).
+    assert report.sent == 1
+    assert report.skipped == []
+    assert fetched == [
+        "https://ci.xiaohongshu.com/spectrum/big",
+        "https://ci.xiaohongshu.com/spectrum/big?imageView2/2/w/3960",
+    ]
+    name, payload, content_type = telegram.files["file0"]
+    assert photo_dimensions(payload) == (4000, 6000)
+    assert content_type == "image/jpeg"
+
+
+@pytest.mark.asyncio
+async def test_photo_within_budget_is_uploaded_without_a_second_fetch(monkeypatch):
+    fetched = []
+
+    async def fake_download(url):
+        fetched.append(url)
+        return _jpeg(1080, 1440), "image/jpeg", url
+
+    telegram = FakeTelegram(fail_urls=True)
+    sender = MediaSender(telegram, mode="auto")
+    monkeypatch.setattr(sender, "_download", fake_download)
+    report = await sender.send(1, [MediaItem("photo", "https://cdn/small")], "cap")
+    await sender.aclose()
+
+    assert report.sent == 1
+    assert fetched == ["https://cdn/small"]
+
+
+@pytest.mark.asyncio
+async def test_oversized_photo_whose_resize_fails_is_skipped_with_reason(monkeypatch):
+    async def fake_download(url):
+        if "imageView2" in url:
+            raise httpx.ConnectError("refused")
+        return _jpeg(4672, 7008), "image/jpeg", url
+
+    telegram = FakeTelegram(fail_urls=True)
+    sender = MediaSender(telegram, mode="auto")
+    monkeypatch.setattr(sender, "_download", fake_download)
+    report = await sender.send(1, [MediaItem("photo", "https://cdn/big")], "cap")
+    await sender.aclose()
+
+    assert report.sent == 0
+    assert len(report.skipped) == 1
+    assert "photo budget" in report.skipped[0]
+    assert "ConnectError" in report.skipped[0]
+
+
+class LoneItemTelegram:
+    """One photo refused as a URL, then refused again as an upload — and the
+    upload failure names no "message #N", because a lone sendPhoto has no
+    album numbering. The drop-and-continue ladder used to fall through to
+    `raise` here, killing the send and every group of the album behind it."""
+
+    async def call(self, method, payload=None, files=None, timeout=None, retries=3):
+        if not files:
+            raise TelegramError(method, 400, "Bad Request: WEBPAGE_CURL_FAILED")
+        raise TelegramError(method, 400, "Bad Request: PHOTO_INVALID_DIMENSIONS")
+
+
+@pytest.mark.asyncio
+async def test_auto_mode_drops_lone_photo_that_names_no_index(monkeypatch):
+    telegram = LoneItemTelegram()
+    sender = MediaSender(telegram, mode="auto")
+
+    async def fake_download(url):
+        return b"bytes", "image/jpeg", url
+
+    monkeypatch.setattr(sender, "_download", fake_download)
+    report = await sender.send(1, [MediaItem("photo", "https://cdn/only")], "cap")
+    await sender.aclose()
+
+    # Skipped with a reason, not raised: a bad photo costs the photo, not the send.
+    assert report.sent == 0
+    assert len(report.skipped) == 1
+    assert "PHOTO_INVALID_DIMENSIONS" in report.skipped[0]
+
+
+@pytest.mark.asyncio
+async def test_album_of_oversized_photos_delivers_every_item_resized(monkeypatch):
+    """The live shape, end to end: note 6aa2df2c… came as 12 photos of
+    4672x7008 — every one over Telegram's width+height budget. The old code
+    dropped nine, died on the tenth bare sendPhoto, and published nothing;
+    with the resize swap every item now delivers at 3960x5940."""
+
+    class AlbumTelegram:
+        def __init__(self):
+            self.groups = 0
+
+        async def call(self, method, payload=None, files=None, timeout=None, retries=3):
+            if not files:
+                raise TelegramError(method, 400, 'Bad Request: failed to send message #6 with the error message "WEBPAGE_CURL_FAILED"')
+            self.groups += 1
+            count = len(payload.get("media", [])) if method == "sendMediaGroup" else 1
+            return [{"message_id": self.groups * 100 + i, "photo": [{"file_id": f"fid{i}"}]} for i in range(count)]
+
+    telegram = AlbumTelegram()
+    sender = MediaSender(telegram, mode="auto")
+    fetched = []
+
+    async def fake_download(url):
+        fetched.append(url)
+        if "imageView2" in url:
+            return _jpeg(3960, 5940), "image/jpeg", url
+        return _jpeg(4672, 7008), "application/octet-stream", url
+
+    monkeypatch.setattr(sender, "_download", fake_download)
+    items = [MediaItem("photo", f"https://ci.xiaohongshu.com/spectrum/{i}") for i in range(12)]
+    report = await sender.send(1, items, "cap")
+    await sender.aclose()
+
+    # Two groups (10 + 2), every photo fetched once as the original and once
+    # resized, nothing skipped, nothing lost.
+    assert report.sent == 12
+    assert report.skipped == []
+    assert telegram.groups == 2
+    assert len(fetched) == 24
+    assert sum(1 for url in fetched if "imageView2" in url) == 12
 
 
 @pytest.mark.asyncio

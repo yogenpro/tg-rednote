@@ -135,6 +135,7 @@ logged.
 | `/acres <cookie or cURL>` | owner | Store the 1point3acres session; the message is deleted on receipt |
 | `/forgetacres` | owner | Wipe the stored 1point3acres session |
 | `/allow <user_id>` · `/deny <user_id>` · `/users` | owner | Manage the allowlist |
+| `/retry [n]` | owner | Replay group submissions that failed (oldest first; bare `/retry` takes them all). Each replay publishes and announces as if the link had just been shared |
 | `/help` | allowlist | Usage |
 
 ### 1point3acres threads
@@ -259,7 +260,12 @@ Add the bot to a group and links posted there become submissions too. It stays q
 apart from one thing: when a note reaches the channel, it replies to the message that carried
 the link with a permalink to the post (or, for a link that's already up, a pointer to the
 existing one). Nothing else — no progress, no errors, no answers to commands or chatter. A
-failed fetch is silent in the group and visible only in the log.
+failed fetch is silent in the group, but it is not lost: transient failures are queued with the
+message that carried the link, and the owner's `/retry` walks the queue through the normal
+submission path — so the announcement replies to the original share, exactly where it would
+have landed had the fetch worked the first time. Failures worth retrying are the transient
+kind (sidecar down, login wall, empty answer); a malformed link is a property of the link and
+is not queued. Only group failures are — a DM already tells its sender what went wrong.
 
 A group starts being watched when **someone on the allowlist adds the bot to it**. If a stranger
 adds the bot somewhere, the group is ignored and the owner is told how to opt in:

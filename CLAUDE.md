@@ -29,7 +29,7 @@ bot/app/
   comments.py   top comments scraped from the note page
   acres.py      1point3acres threads: link shapes, de-jamming, reply ranking
   telegraph.py  telegra.ph client; a forum thread goes out as one page
-  state.py      atomic 0600 state.json (owner, allowlist, cookie, health)
+  state.py      atomic 0600 state.json (owner, allowlist, cookie, health, retry queue)
   telegram.py   raw Bot API client (429 handling, token redaction)
   cache.py      LRU with TTL
 tools/spike.py  stdlib-only probe for the two PLAN §10 assumptions

@@ -57,6 +57,13 @@ class State:
         # note_id -> {"chat": str, "message_id": int, "at": iso}. Keeps a
         # resubmitted link from posting to the channel twice.
         "published": {},
+        # Group submissions that died before publishing, newest last. A group
+        # failure is silence by design — no error reply exists to resend — so
+        # the link is kept here with the one thing a replay needs and nothing
+        # else records: the message that carried it, for the announcement to
+        # reply to when /retry finally walks it through. A DM failure is not
+        # queued: its sender was told, and can resend.
+        "failures": [],
     }
 
     def __init__(self, path: Path):
@@ -265,6 +272,67 @@ class State:
             return False
         index.pop(note_id)
         self.data["published"] = index
+        self.save()
+        return True
+
+    # Enough for a bad fortnight; the point of the cap is that a queue nobody
+    # drains cannot quietly grow into a second log file.
+    FAILURES_LIMIT = 100
+
+    def failures(self) -> list[dict]:
+        """A snapshot. /retry iterates it while the live list may change."""
+        return [dict(entry) for entry in self.data.get("failures") or []]
+
+    @staticmethod
+    def _failure_key(link, chat, message_id) -> tuple[str, str, str]:
+        # Stringly on purpose: a None message id and a missing one must key
+        # the same, whatever the JSON round-trip did to the numbers.
+        return (str(link), str(chat), str(message_id))
+
+    def record_failure(
+        self, link: str, chat: int, message_id: int | None,
+        user_id: int | None, why: str,
+    ) -> None:
+        """Remember a dead group submission, or count another attempt at one.
+
+        Replaced, not appended: a link shared twice during the same outage is
+        one entry, keeping the message id of the share it must eventually
+        answer and a count of the attempts. The bot already answers a
+        resubmission with a pointer to the existing post, so a replayed queue
+        never publishes a note twice.
+        """
+        key = self._failure_key(link, chat, message_id)
+        kept: list[dict] = []
+        tries = 1
+        for entry in self.data.get("failures") or []:
+            if self._failure_key(
+                entry.get("link"), entry.get("chat"), entry.get("message_id")
+            ) == key:
+                tries = int(entry.get("tries") or 0) + 1
+            else:
+                kept.append(entry)
+        kept.append({
+            "link": link, "chat": chat, "message_id": message_id,
+            "user": user_id, "at": utcnow(), "tries": tries, "why": why,
+        })
+        while len(kept) > self.FAILURES_LIMIT:
+            kept.pop(0)  # oldest first out, matching insertion order
+        self.data["failures"] = kept
+        self.save()
+
+    def drop_failure(self, link: str, chat: int, message_id: int | None) -> bool:
+        """Forget a queued submission — it went through, no retry is owed."""
+        key = self._failure_key(link, chat, message_id)
+        entries = list(self.data.get("failures") or [])
+        kept = [
+            entry for entry in entries
+            if self._failure_key(
+                entry.get("link"), entry.get("chat"), entry.get("message_id")
+            ) != key
+        ]
+        if len(kept) == len(entries):
+            return False
+        self.data["failures"] = kept
         self.save()
         return True
 

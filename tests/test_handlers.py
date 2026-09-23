@@ -1414,6 +1414,199 @@ async def test_group_admin_commands_are_owner_only(tmp_path):
     assert "Owner only" in telegram.texts
 
 
+# ---- the retry queue --------------------------------------------------
+
+class ReplyRecorder(FakeTelegram):
+    """Keeps the reply_to the base fake throws away, so a test can ask what
+    an announcement was anchored to."""
+
+    def __init__(self):
+        super().__init__()
+        self.replies: list[tuple[int, int | None]] = []
+
+    async def send_message(self, chat_id, text, *, reply_to=None, preview=False):
+        self.replies.append((chat_id, reply_to))
+        return await super().send_message(chat_id, text, reply_to=reply_to, preview=preview)
+
+
+class PickyDownloader(FakeDownloader):
+    """Serves every link except the bad ones, so one /retry can watch a
+    resolved entry and a re-failed one side by side."""
+
+    def __init__(self, note, bad_links):
+        super().__init__(note)
+        self.bad_links = bad_links
+
+    async def detail(self, url, cookie):
+        if url in self.bad_links:
+            raise XhsError("network", "downloader unreachable")
+        return await super().detail(url, cookie)
+
+
+def group_share(link, *, user=55, message_id=77, chat=WATCHED):
+    update = group_message(link, user=user, chat=chat)
+    update["message"]["message_id"] = message_id
+    return update
+
+
+@pytest.mark.asyncio
+async def test_a_transient_group_failure_is_queued_with_its_message_id(tmp_path):
+    """The queue exists to close the gap between "silent in the group" and
+    "replayable later": the message id is the one thing a hand-rolled replay
+    could not recover, so it is the one thing this test insists on."""
+    downloader = FakeDownloader(error=XhsError("network", "downloader unreachable"))
+    bot, telegram, state = channel_bot(tmp_path, downloader=downloader)
+    state.allow_group(WATCHED, "Some Group", 1)
+
+    await bot.handle_update(group_share("http://xhslink.com/o/x", message_id=77))
+
+    assert all(chat != WATCHED for chat, _ in telegram.sent)  # still silent
+    entries = state.failures()
+    assert len(entries) == 1
+    assert entries[0]["link"] == "http://xhslink.com/o/x"
+    assert entries[0]["chat"] == WATCHED
+    assert entries[0]["message_id"] == 77
+    assert entries[0]["why"] == "network"
+    assert entries[0]["tries"] == 1
+
+
+@pytest.mark.asyncio
+async def test_a_permanent_failure_is_not_queued(tmp_path):
+    downloader = FakeDownloader(error=XhsError("bad_link", "not a note"))
+    bot, _telegram, state = channel_bot(tmp_path, downloader=downloader)
+    state.allow_group(WATCHED, "Some Group", 1)
+
+    await bot.handle_update(group_share("http://xhslink.com/o/x"))
+
+    assert state.failures() == []
+
+
+@pytest.mark.asyncio
+async def test_a_dm_failure_is_not_queued(tmp_path):
+    """A DM already told its sender; the queue is for the audience that
+    cannot be told."""
+    downloader = FakeDownloader(error=XhsError("network", "downloader unreachable"))
+    bot, telegram, state = channel_bot(tmp_path, downloader=downloader)
+
+    await bot.handle_update(message("http://xhslink.com/o/x", user=1))
+
+    assert "downloader sidecar" in telegram.texts
+    assert state.failures() == []
+
+
+@pytest.mark.asyncio
+async def test_the_same_share_failing_twice_is_one_entry_with_two_tries(tmp_path):
+    downloader = FakeDownloader(error=XhsError("network", "downloader unreachable"))
+    bot, _telegram, state = channel_bot(tmp_path, downloader=downloader)
+    state.allow_group(WATCHED, "Some Group", 1)
+
+    await bot.handle_update(group_share("http://xhslink.com/o/x", message_id=77))
+    await bot.handle_update(group_share("http://xhslink.com/o/x", message_id=77))
+
+    entries = state.failures()
+    assert len(entries) == 1
+    assert entries[0]["tries"] == 2
+
+
+@pytest.mark.asyncio
+async def test_retry_replays_through_the_live_path_and_replies_to_the_original_share(tmp_path):
+    """The whole point of keeping the message id: the catch-up announcement
+    lands as a reply to the message that carried the link, indistinguishable
+    from a submission that worked the first time."""
+    downloader = FakeDownloader(NOTE, error=XhsError("network", "downloader unreachable"))
+    bot, _telegram, state = channel_bot(tmp_path, downloader=downloader)
+    state.allow_group(WATCHED, "Some Group", 1)
+    recording = ReplyRecorder()
+    bot.tg = recording
+
+    await bot.handle_update(group_share("http://xhslink.com/o/x", message_id=77))
+    downloader.error = None  # the outage is over
+    await bot.handle_update(message("/retry", user=1))
+
+    assert len(bot.sender.sends) == 1  # the album went to the channel
+    assert state.published("650a")["message_id"] == 1
+    announce = [t for c, t in recording.sent if c == WATCHED]
+    assert len(announce) == 1
+    assert "https://t.me/mychannel/1" in announce[0]
+    assert (WATCHED, 77) in recording.replies  # anchored to the original share
+    assert state.failures() == []  # resolved, so no retry is owed
+    assert "Retry done: 1 published" in recording.texts
+
+
+@pytest.mark.asyncio
+async def test_a_replayed_link_already_published_points_both_shares_at_the_post(tmp_path):
+    """Two messages shared the same link and both failed. The replay
+    publishes once and answers each share where it stands."""
+    downloader = FakeDownloader(NOTE, error=XhsError("network", "downloader unreachable"))
+    bot, _telegram, state = channel_bot(tmp_path, downloader=downloader)
+    state.allow_group(WATCHED, "Some Group", 1)
+    recording = ReplyRecorder()
+    bot.tg = recording
+
+    await bot.handle_update(group_share("http://xhslink.com/o/x", message_id=77, user=55))
+    await bot.handle_update(group_share("http://xhslink.com/o/x", message_id=78, user=56))
+    downloader.error = None
+    await bot.handle_update(message("/retry", user=1))
+
+    assert len(bot.sender.sends) == 1  # posted once, not twice
+    announced = [text for chat, text in recording.sent if chat == WATCHED]
+    assert "see the post" in announced[0]
+    assert "Already on the channel" in announced[1]
+    assert (WATCHED, 77) in recording.replies
+    assert (WATCHED, 78) in recording.replies
+    assert state.failures() == []
+
+
+@pytest.mark.asyncio
+async def test_retry_keeps_what_fails_again_and_counts_the_attempt(tmp_path):
+    downloader = PickyDownloader(NOTE, bad_links={"http://xhslink.com/o/bad", "http://xhslink.com/o/good"})
+    bot, _telegram, state = channel_bot(tmp_path, downloader=downloader)
+    state.allow_group(WATCHED, "Some Group", 1)
+
+    await bot.handle_update(group_share("http://xhslink.com/o/bad", message_id=77))
+    await bot.handle_update(group_share("http://xhslink.com/o/good", message_id=78))
+    downloader.bad_links.discard("http://xhslink.com/o/good")  # the outage half-recovers
+    await bot.handle_update(message("/retry", user=1))
+
+    remaining = state.failures()
+    assert len(remaining) == 1
+    assert remaining[0]["link"] == "http://xhslink.com/o/bad"
+    assert remaining[0]["tries"] == 2
+    assert "1 published" in bot.tg.texts
+    assert "1 failed again" in bot.tg.texts
+
+
+@pytest.mark.asyncio
+async def test_retry_takes_only_the_n_oldest(tmp_path):
+    downloader = FakeDownloader(NOTE, error=XhsError("network", "downloader unreachable"))
+    bot, _telegram, state = channel_bot(tmp_path, downloader=downloader)
+    state.allow_group(WATCHED, "Some Group", 1)
+
+    await bot.handle_update(group_share("http://xhslink.com/o/first", message_id=77))
+    await bot.handle_update(group_share("http://xhslink.com/o/second", message_id=78))
+    downloader.error = None
+    await bot.handle_update(message("/retry 1", user=1))
+
+    remaining = state.failures()
+    assert len(remaining) == 1
+    assert remaining[0]["link"] == "http://xhslink.com/o/second"
+
+
+@pytest.mark.asyncio
+async def test_retry_on_an_empty_queue_says_so(tmp_path):
+    bot, telegram, _state = channel_bot(tmp_path)
+    await bot.handle_update(message("/retry", user=1))
+    assert "Nothing to retry" in telegram.texts
+
+
+@pytest.mark.asyncio
+async def test_retry_is_owner_only(tmp_path):
+    bot, telegram, state = channel_bot(tmp_path)
+    state.allow(9)
+    await bot.handle_update(message("/retry", user=9))
+    assert "Owner only" in telegram.texts
+
+
 # ---- when nothing actually gets sent ---------------------------------
 
 class SkippingSender(FakeSender):

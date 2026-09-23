@@ -68,6 +68,7 @@ OWNER_HELP = HELP + """
 <b>Owner only</b>
 /allow &lt;user_id&gt; · /deny &lt;user_id&gt; · /users
 /groups · /allowgroup &lt;chat_id&gt; · /denygroup &lt;chat_id&gt;
+/retry [n] — replay group submissions that failed, oldest first
 /acres &lt;cookie or curl&gt; · /forgetacres"""
 
 # Shown at the foot of a message that has a continuation. Kept short: it costs
@@ -569,6 +570,9 @@ class Bot:
             return
         if command == "/mode":
             await self._handle_mode(chat_id, user_id, text)
+            return
+        if command == "/retry":
+            await self._handle_retry(chat_id, user_id, text)
             return
         if command in ("/allow", "/deny", "/users"):
             await self._handle_admin(chat_id, user_id, command, text)
@@ -1202,6 +1206,101 @@ class Bot:
                 f"{target} removed." if removed else f"{target} is not removable (unknown, or the owner).",
             )
 
+    # ---- the retry queue ----------------------------------------------
+
+    # Failure kinds worth another attempt. A wall or an empty answer can
+    # clear with a new cookie or a calmer rate limit; a bad link or a profile
+    # link is a property of the link, and replaying it would only fail the
+    # same way twice.
+    RETRYABLE = ("network", "blocked", "empty")
+
+    def _remember_failure(
+        self, link: str, user_id: int | None,
+        announce_to: tuple[int, int | None], why: str,
+    ) -> None:
+        """Queue a dead group submission so /retry can give it another turn.
+
+        Only announce_to submissions — a group, whose failures are silence by
+        design. A DM already told its sender what went wrong and can be resent;
+        the group cannot know to, which is the asymmetry the queue exists to
+        close. The message id travels with the link so the eventual
+        announcement replies to the share that carried it, exactly where a
+        live submission's would have landed.
+        """
+        chat, message_id = announce_to
+        self.state.record_failure(link, chat, message_id, user_id, why)
+        log.info(
+            "queued %s for retry (%s)", cache_key(link), why,
+            extra=fields(event="retry_queued", chat=chat, why=why),
+        )
+
+    async def _handle_retry(self, chat_id: int, user_id: int, text: str) -> None:
+        """Replay queued group submissions through the live submission path.
+
+        Born from an outage that kept every container green for eleven hours:
+        the fetch was fixed, but the group's links lived only in the log, and a
+        replay by hand announced to nothing in particular because the message
+        ids were gone. Here the ids are not gone — they were kept at failure
+        time — and the replay is _handle_link itself, so publishing,
+        deduplication and the announcement behave exactly as if the note had
+        arrived when it was shared. An entry that fails again re-queues itself
+        (with its attempt count bumped); one that resolves is dropped.
+        """
+        if user_id != self.state.owner_id:
+            await self._reply(chat_id, "Owner only.")
+            return
+        parts = text.split()
+        limit: int | None = None
+        if len(parts) > 1:
+            if not parts[1].isdigit() or int(parts[1]) < 1:
+                await self._reply(
+                    chat_id,
+                    "Usage: <code>/retry [n]</code> — replay failed group "
+                    "submissions, oldest first. Bare <code>/retry</code> takes them all.",
+                )
+                return
+            limit = int(parts[1])
+        entries = self.state.failures()
+        if not entries:
+            await self._reply(chat_id, "Nothing to retry — no failed submissions are queued.")
+            return
+        if limit is not None:
+            entries = entries[:limit]
+        outcomes: dict[str, int] = {}
+        async with self._busy(chat_id, "upload_photo"):
+            for entry in entries:
+                current_rid.set(new_rid())
+                try:
+                    outcome = await self._handle_link(
+                        None, None, entry["link"], entry.get("user"),
+                        announce_to=(entry["chat"], entry.get("message_id")),
+                    )
+                except Exception:
+                    # A surprise on one link must not strand the rest of the
+                    # queue; the entry simply stays for the next /retry.
+                    log.exception("retry of %s raised", cache_key(entry["link"]))
+                    outcome = "raised"
+                outcomes[outcome] = outcomes.get(outcome, 0) + 1
+                if outcome in ("published", "duplicate"):
+                    self.state.drop_failure(
+                        entry["link"], entry["chat"], entry.get("message_id")
+                    )
+        log.info(
+            "retry finished: %s", outcomes,
+            extra=fields(event="retry", **outcomes),
+        )
+        summary = [
+            f"{outcomes.get('published', 0)} published",
+            f"{outcomes.get('duplicate', 0)} already published",
+        ]
+        again = outcomes.get("failed", 0) + outcomes.get("empty", 0) \
+            + outcomes.get("refused", 0) + outcomes.get("raised", 0)
+        if again:
+            summary.append(f"{again} failed again and stayed queued")
+        await self._reply(
+            chat_id, f"Retry done: {', '.join(summary)}."
+        )
+
     # ---- the note flow (PLAN §4) -------------------------------------
 
     def _warn_owner_cookieless(self) -> bool:
@@ -1244,7 +1343,7 @@ class Bot:
         *,
         announce_to: tuple[int, int | None] | None = None,
         publish: bool = True,
-    ) -> None:
+    ) -> str:
         """Fetch a note and deliver it.
 
         `chat_id` is where the submitter is waiting — None for a group
@@ -1253,6 +1352,11 @@ class Bot:
         for a group submission is the message that carried the link.
         `publish` False keeps the note in the DM it came from even though a
         channel is configured (/mode private).
+
+        Returns how it ended — "published", "duplicate", "failed", "empty",
+        "refused" or "skipped" — so /retry can report and drain the queue
+        without guessing from the state file. Callers that ignore the answer
+        (the live paths) are unaffected.
         """
         started = time.monotonic()
         channel = self.channel if publish else None
@@ -1265,7 +1369,9 @@ class Bot:
                     note = await self.xhs.detail(link, self.state.cookie)
                 except XhsError as exc:
                     await self._handle_fetch_error(chat_id, message_id, exc, user_id)
-                    return
+                    if announce_to and exc.kind in self.RETRYABLE:
+                        self._remember_failure(link, user_id, announce_to, exc.kind)
+                    return "failed"
             self.state.mark_fetch_success()
             self.notes.put(key, note)
             if note.note_id:
@@ -1290,7 +1396,9 @@ class Bot:
         )
         if not items:
             await self._reply(chat_id, "That note has no media I can send.", reply_to=message_id)
-            return
+            if announce_to:
+                self._remember_failure(link, user_id, announce_to, "empty")
+            return "empty"
 
         # In channel mode a link is a submission, so a resubmission should point
         # at the existing post rather than duplicate it.
@@ -1310,7 +1418,7 @@ class Bot:
                     else "That one is already on the channel.",
                     reply_to=in_reply_to,
                 )
-                return
+                return "duplicate"
 
         comments = await self._comments(note)
         # Reading the page can turn up smaller renditions of an oversized
@@ -1366,7 +1474,7 @@ class Bot:
         # whoever asked. A channel post can't reply to a user's message.
         target = channel["id"] if channel else chat_id
         if target is None:  # a group submission with nowhere to publish
-            return
+            return "skipped"
         reply_to = None if channel else message_id
 
         # The follow-up text: the note's overflow, then comments. When the
@@ -1405,7 +1513,9 @@ class Bot:
                     f"<b>{escape(channel['title'])}</b>: "
                     f"<code>{escape(exc.description)}</code>"
                 )
-            return
+            if announce_to:
+                self._remember_failure(link, user_id, announce_to, "refused")
+            return "refused"
 
         log.info(
             "delivered %d item(s) in %.1fs via %s%s",
@@ -1440,7 +1550,9 @@ class Bot:
                 + "; ".join(escape(s) for s in report.skipped),
                 reply_to=message_id,
             )
-            return
+            if announce_to:
+                self._remember_failure(link, user_id, announce_to, "empty")
+            return "empty"
         # Everything else follows in the same chat, chained onto the post —
         # text the album's captions could not carry (a dropped group hands
         # its share back unused) plus whatever never fit in a caption.
@@ -1514,6 +1626,7 @@ class Bot:
             await self._announce_published(
                 where, in_reply_to, note.note_id, report.first_message_id
             )
+        return "published"
 
     @staticmethod
     def _follow_up(

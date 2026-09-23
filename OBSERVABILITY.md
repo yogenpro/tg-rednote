@@ -51,6 +51,8 @@ a single note's whole journey comes out with one filter — which is the differe
 | `page_unavailable` | Neither domain served the page | `note` |
 | `media_skipped` | Item(s) dropped | `count` |
 | `delivery_empty` | Nothing sent at all | `note` |
+| `retry_queued` | A group submission died before publishing; kept for `/retry` | `chat`, `why` |
+| `retry` | A `/retry` run finished | one count per outcome (`published`, `duplicate`, `failed`, …) |
 | `poll_error` / `poll_conflict` | Telegram polling trouble | `code` |
 | `crash` | Unhandled error on an update | `update_id` |
 | `shutdown_timeout` | Clients did not close within 10s of exiting | — |

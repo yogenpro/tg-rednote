@@ -228,13 +228,18 @@ sequence is sent — message ids can't be predicted — and the caption reserves
 front.
 
 Large videos use the same continuation flow. In `auto` and `upload` mode, videos
-larger than 20 MiB are split losslessly at keyframes into independently playable
-MP4 segments, each at most 20 MiB. Each segment is a separate `[1/n]`, `[2/n]`, …
+larger than the upload limit (50 MiB by default) are split losslessly at keyframes
+into independently playable MP4 segments. Uploadable originals stay intact:
+a 45 MiB video remains one video; a 95 MiB video targets two parts. Boundaries
+are selected from packet byte offsets to fill the fewest safe parts, with small
+room for MP4 headers; actual output sizes are checked against the upload limit.
+Keyframe spacing can require an extra part. Each segment is a separate `[1/n]`, `[2/n]`, …
 video post replying to the previous one; channel captions get the same
 `continues ↓` links, and description overflow rides later segments' captions.
 This also recovers videos whose smallest available rendition exceeds the
 50 MiB upload limit. A small known video keeps its normal URL/file-id path;
-explicit `url` mode continues to hand URLs to Telegram without local processing.
+an existing rendition that fits also stays a single video.
+Explicit `url` mode continues to hand URLs to Telegram without local processing.
 
 The image includes FFmpeg/ffprobe. Sources are streamed to a private temporary
 directory, not held entirely in memory. Preparation is serialized and bounded

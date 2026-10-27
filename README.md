@@ -242,6 +242,9 @@ to 500 MiB of sources per submission and 64 segments per video. Actual segment
 sizes and durations are checked before any segment is posted. A video that
 cannot be split safely fails and remains queued; it is never silently truncated
 or re-encoded. Temporary files are removed after success, failure or cancellation.
+Video uploads stream in 64 KiB writes, so progress on a slow connection does not
+require a whole segment to fit inside one write timeout. Request retries rewind
+the stream to its beginning.
 Interrupted delivery can leave already-posted segments, as with a partially
 sent photo album; the publication index is updated only after complete delivery.
 

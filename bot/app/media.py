@@ -15,6 +15,7 @@ import asyncio
 import logging
 import mimetypes
 import hashlib
+import io
 import shutil
 import tempfile
 from contextlib import asynccontextmanager
@@ -506,7 +507,11 @@ class MediaSender:
                     continue
                 name, content_type = self._naming(item.kind, content_type, index)
                 key = f"file{index}"
-                files[key] = (name, payload, content_type)
+                # httpx sends raw bytes as one write, but reads a seekable
+                # stream in 64 KiB chunks and rewinds it on request retries.
+                # A slow, progressing video upload must not need one giant
+                # write to finish inside the per-write timeout.
+                files[key] = (name, io.BytesIO(payload) if item.kind == "video" else payload, content_type)
                 entry["media"] = f"attach://{key}"
             else:
                 entry["media"] = item.url

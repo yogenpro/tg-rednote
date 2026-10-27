@@ -23,7 +23,10 @@ class Telegram:
         self.fail_part = fail_part
 
     async def call(self, method, payload, files=None, **kwargs):
-        self.calls.append((method, dict(payload), dict(files or {})))
+        captured = {}
+        for key, (name, body, mime) in (files or {}).items():
+            captured[key] = (name, body.getvalue() if hasattr(body, "getvalue") else body, mime)
+        self.calls.append((method, dict(payload), captured))
         index = len(self.calls)
         if index == self.fail_part:
             raise TelegramError(method, 0, "WriteTimeout")
@@ -265,3 +268,44 @@ async def test_real_preparation_flows_into_separate_telegram_continuations(sampl
         assert all(not path.exists() for path in paths)
     finally:
         await sender.aclose()
+
+
+@pytest.mark.asyncio
+async def test_video_upload_uses_bounded_write_chunks_and_rewinds_on_retry(tmp_path, monkeypatch):
+    from app.telegram import Telegram as RealTelegram
+
+    payload = bytes(range(256)) * 1024
+    source = tmp_path / "segment.mp4"
+    source.write_bytes(payload)
+    attempts = []
+
+    class Transport(httpx.AsyncBaseTransport):
+        async def handle_async_request(self, request):
+            chunks = [chunk async for chunk in request.stream]
+            attempts.append(chunks)
+            if len(attempts) == 1:
+                raise httpx.WriteTimeout("simulated slow upload", request=request)
+            return httpx.Response(200, request=request, json={
+                "ok": True, "result": {"message_id": 5, "video": {"file_id": "file-id"}},
+            })
+
+    async def no_sleep(_):
+        pass
+
+    monkeypatch.setattr(asyncio, "sleep", no_sleep)
+    telegram = RealTelegram("123:FAKE_TOKEN_FOR_OFFLINE_TEST_ONLY")
+    await telegram._client.aclose()
+    telegram._client = httpx.AsyncClient(transport=Transport())
+    sender = MediaSender(telegram)
+    try:
+        item = MediaItem("video", "segment-key", local_path=source, continuation=True)
+        report = await sender.send(1, [item], "caption")
+        assert report.sent == 1 and len(attempts) == 2
+        for chunks in attempts:
+            assert max(map(len, chunks)) <= 64 * 1024
+            assert payload in b"".join(chunks)
+        assert b"".join(attempts[0]).count(payload) == 1
+        assert b"".join(attempts[1]).count(payload) == 1
+    finally:
+        await sender.aclose()
+        await telegram.aclose()

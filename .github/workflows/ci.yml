@@ -53,6 +53,13 @@ jobs:
     needs: pytest
     if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - context: ./bot
+            suffix: ""
+          - context: ./login
+            suffix: "-login"
     permissions:
       contents: read
       packages: write
@@ -76,7 +83,7 @@ jobs:
         id: meta
         uses: docker/metadata-action@v6
         with:
-          images: ${{ env.REGISTRY }}/${{ env.IMAGE }}
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE }}${{ matrix.suffix }}
           tags: |
             type=raw,value=latest,enable={{is_default_branch}}
             type=ref,event=branch
@@ -87,7 +94,7 @@ jobs:
       - name: Build and push
         uses: docker/build-push-action@v7
         with:
-          context: ./bot
+          context: ${{ matrix.context }}
           platforms: linux/amd64,linux/arm64
           push: true
           tags: ${{ steps.meta.outputs.tags }}

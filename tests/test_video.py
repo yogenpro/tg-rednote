@@ -136,7 +136,8 @@ def test_delivery_groups_keep_photo_albums_and_segment_order():
 
 @pytest.mark.asyncio
 async def test_known_small_videos_and_explicit_url_mode_keep_url_delivery():
-    for mode, size in [("auto", 100), ("url", video.SOURCE_BYTES * 2)]:
+    for mode, size in [("auto", 100), ("auto", 45 * 1024 * 1024),
+                       ("auto", 50 * 1024 * 1024), ("url", video.SOURCE_BYTES * 2)]:
         telegram = Telegram()
         sender = MediaSender(telegram, mode=mode)
         try:
@@ -176,10 +177,15 @@ async def test_invalid_duration_fails_before_sending(monkeypatch, tmp_path, raw)
 
 
 @pytest.mark.asyncio
-async def test_split_rechecks_actual_bytes_and_retries_shorter_interval(monkeypatch, tmp_path):
+async def test_split_rechecks_actual_muxed_bytes_and_replans_boundaries(monkeypatch, tmp_path):
     source = tmp_path / "source.mp4"
     source.write_bytes(b"x" * 100)
     intervals = []
+
+    async def keyframes(_):
+        return [(0, 0), (3, 30), (4, 40), (6, 60), (8, 80)]
+
+    monkeypatch.setattr(video, "keyframe_offsets", keyframes)
 
     async def tool(*args, **kwargs):
         if args[0] == "ffprobe":
@@ -204,7 +210,7 @@ def sample_video(tmp_path):
     subprocess.run([
         "ffmpeg", "-nostdin", "-v", "error", "-f", "lavfi", "-i", "testsrc2=size=160x120:rate=10",
         "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=44100", "-t", "12",
-        "-c:v", "libx264", "-preset", "veryfast", "-crf", "18", "-g", "10",
+        "-c:v", "libx264", "-preset", "veryfast", "-crf", "18", "-g", "2",
         "-c:a", "aac", "-b:a", "64k", "-movflags", "+faststart", str(path),
     ], check=True, stdin=subprocess.DEVNULL, timeout=30)
     return path
@@ -247,9 +253,8 @@ async def test_invalid_real_media_fails_safely(tmp_path):
 @pytest.mark.asyncio
 async def test_real_preparation_flows_into_separate_telegram_continuations(sample_video, monkeypatch):
     target = 48 * 1024
-    monkeypatch.setattr(media, "SEGMENT_BYTES", target)
     telegram = Telegram()
-    sender = MediaSender(telegram, mode="auto")
+    sender = MediaSender(telegram, mode="auto", max_bytes=target)
     await sender._client.aclose()
     sender._client = httpx.AsyncClient(transport=httpx.MockTransport(
         lambda r: httpx.Response(200, request=r, content=sample_video.read_bytes())
@@ -309,3 +314,82 @@ async def test_video_upload_uses_bounded_write_chunks_and_rewinds_on_retry(tmp_p
     finally:
         await sender.aclose()
         await telegram.aclose()
+
+
+@pytest.mark.parametrize("size_mib,expected_parts", [(95, 2), (119, 3), (145, 3)])
+def test_byte_planner_uses_near_limit_parts(size_mib, expected_parts):
+    mib = 1024 * 1024
+    keyframes = [(float(i), i * mib) for i in range(size_mib)]
+    cuts = video.plan_cuts(keyframes, size_mib * mib, 50 * mib - 65536)
+    assert len(cuts) + 1 == expected_parts
+
+
+def test_source_just_over_the_limit_is_not_mistaken_for_a_fitting_video_after_header_offset():
+    assert len(video.plan_cuts([(0.0, 1024), (1.0, 49000), (2.0, 51000)], 52500, 52400)) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("size_mib", [45, 50])
+async def test_uploadable_original_is_never_sent_to_ffmpeg(tmp_path, monkeypatch, size_mib):
+    source = tmp_path / "fits.mp4"
+    with source.open("wb") as output:
+        output.truncate(size_mib * 1024 * 1024)
+
+    async def forbidden(*args, **kwargs):
+        raise AssertionError("An uploadable video must not be split or probed")
+
+    monkeypatch.setattr(video, "run_media_tool", forbidden)
+    assert await video.split_video(source, tmp_path / "parts") == [source]
+    assert not (tmp_path / "parts").exists()
+
+
+@pytest.mark.asyncio
+async def test_original_that_actually_fits_stays_one_video_despite_stale_size_metadata():
+    telegram = Telegram()
+    sender = MediaSender(telegram, max_bytes=1024)
+    await sender._client.aclose()
+    sender._client = httpx.AsyncClient(transport=httpx.MockTransport(
+        lambda r: httpx.Response(200, request=r, content=b"v" * 900)
+    ))
+    try:
+        report = await sender.send(1, [MediaItem("video", "https://cdn/original", size=2048)], "caption")
+        assert report.sent == 1 and len(telegram.calls) == 1
+        assert telegram.calls[0][1]["caption"] == "caption"
+        assert telegram.calls[0][1]["video"] == "https://cdn/original"
+    finally:
+        await sender.aclose()
+
+
+@pytest.mark.ffmpeg
+@pytest.mark.asyncio
+async def test_real_video_at_95_to_50_ratio_produces_two_playable_parts(sample_video, tmp_path):
+    import math
+    limit = math.ceil(sample_video.stat().st_size * 50 / 95)
+    parts = await video.split_video(sample_video, tmp_path / "two-parts", limit)
+    assert len(parts) == 2
+    assert all(p.stat().st_size <= limit for p in parts)
+    for part in parts:
+        await video.run_media_tool("ffmpeg", "-nostdin", "-v", "error", "-i", str(part), "-f", "null", "-")
+
+
+@pytest.mark.asyncio
+async def test_existing_fitting_rendition_remains_one_video():
+    telegram = Telegram()
+    sender = MediaSender(telegram, max_bytes=1024)
+    requested = []
+
+    def source(request):
+        requested.append(str(request.url))
+        return httpx.Response(200, request=request, content=b"v" * 900)
+
+    await sender._client.aclose()
+    sender._client = httpx.AsyncClient(transport=httpx.MockTransport(source))
+    try:
+        item = MediaItem("video", "https://cdn/original", size=2048,
+                         alternatives=(("https://cdn/fitting", 900),))
+        report = await sender.send(1, [item], "caption")
+        assert requested == ["https://cdn/fitting"]
+        assert report.sent == 1 and len(telegram.calls) == 1
+        assert telegram.calls[0][1]["caption"] == "caption"
+    finally:
+        await sender.aclose()

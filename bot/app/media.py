@@ -31,7 +31,7 @@ from .cache import LRU
 from .logs import fields
 from .telegram import CAPTION_LIMIT, MEDIA_GROUP_LIMIT, MESSAGE_LIMIT, Telegram, TelegramError
 from .xhs import MediaItem, Note
-from .video import SEGMENT_BYTES, SOURCE_BYTES, VideoPreparationError, download_video, split_video
+from .video import SOURCE_BYTES, VideoPreparationError, download_video, split_video
 
 log = logging.getLogger(__name__)
 
@@ -307,7 +307,7 @@ class MediaSender:
         if self._configured_mode == "url":
             yield items
             return
-        target = min(SEGMENT_BYTES, self._max_bytes)
+        target = self._max_bytes
         needed = [item for item in items if item.kind == "video" and not item.local_path
                   and not self._file_ids.get(item.url) and (not item.size or item.size > target)]
         if not needed:

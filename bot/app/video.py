@@ -9,7 +9,7 @@ from pathlib import Path
 
 import httpx
 
-SEGMENT_BYTES = 20 * 1024 * 1024
+UPLOAD_BYTES = 50 * 1024 * 1024
 SOURCE_BYTES = 500 * 1024 * 1024
 MAX_SEGMENTS = 64
 
@@ -26,8 +26,17 @@ async def run_media_tool(*args: str, timeout: float = 120) -> bytes:
         )
     except OSError:
         raise VideoPreparationError("Video processing tools are unavailable.") from None
+    async def collect():
+        output = bytearray()
+        while block := await process.stdout.read(64 * 1024):
+            output.extend(block)
+            if len(output) > 32 * 1024 * 1024:
+                raise VideoPreparationError("Video metadata exceeds its processing limit.")
+        await process.wait()
+        return bytes(output)
+
     try:
-        stdout, _ = await asyncio.wait_for(process.communicate(), timeout)
+        stdout = await asyncio.wait_for(collect(), timeout)
     except BaseException:
         # Cancellation must not leave ffmpeg writing into a removed temp dir.
         if process.returncode is None:
@@ -76,20 +85,68 @@ async def download_video(client: httpx.AsyncClient, url: str, path: Path, limit:
     return size
 
 
-async def split_video(source: Path, directory: Path, max_bytes: int = SEGMENT_BYTES) -> list[Path]:
-    """Copy complete keyframe-aligned segments, then verify actual byte sizes.
+def plan_cuts(keyframes: list[tuple[float, int]], size: int, budget: int) -> list[float]:
+    """Fill each part at the furthest safe keyframe to minimize part count.
 
-    VBR/keyframe placement makes a time estimate insufficient. Retry with a
-    shorter interval when necessary, and fail before any post if a bound cannot
-    be met. No arbitrary non-keyframe cuts or silent truncation.
+    Packet offsets account for VBR/interleaved audio; equal times do not.
+    Actual muxed sizes are checked separately.
     """
+    cuts = []
+    current = 0
+    start = 0  # the first part also needs the original container's header room
+    while size - start > budget:
+        end = current
+        while end + 1 < len(keyframes) and keyframes[end + 1][1] - start <= budget:
+            end += 1
+        if end == current:
+            raise VideoPreparationError("This video's keyframes prevent safe size-bounded splitting.")
+        cuts.append(keyframes[end][0] - keyframes[0][0])
+        current = end
+        start = keyframes[current][1]
+        if len(cuts) >= MAX_SEGMENTS:
+            raise VideoPreparationError("Video splitting would exceed the 64-segment limit.")
+    return cuts
+
+
+async def keyframe_offsets(source: Path) -> list[tuple[float, int]]:
+    raw = await run_media_tool(
+        "ffprobe", "-v", "error", "-protocol_whitelist", "file,pipe", "-f", "mov",
+        "-select_streams", "v:0", "-show_packets", "-show_entries", "packet=pts_time,pos,flags",
+        "-of", "compact=p=0:nk=0", str(source),
+    )
+    result = []
+    try:
+        for line in raw.decode().splitlines():
+            values = dict(part.split("=", 1) for part in line.split("|") if "=" in part)
+            if "K" not in values.get("flags", ""):
+                continue
+            seconds, position = float(values["pts_time"]), int(values["pos"])
+            if not math.isfinite(seconds) or position < 0:
+                raise ValueError
+            if result and (seconds <= result[-1][0] or position <= result[-1][1]):
+                raise ValueError
+            result.append((seconds, position))
+    except (UnicodeError, ValueError, KeyError):
+        raise VideoPreparationError("The video has no usable keyframe boundaries.") from None
+    if not result:
+        raise VideoPreparationError("The video has no usable keyframe boundaries.")
+    return result
+
+
+async def split_video(source: Path, directory: Path, max_bytes: int = UPLOAD_BYTES) -> list[Path]:
+    """Leave uploadable sources intact; fill the fewest size-safe video parts."""
     size = source.stat().st_size
     if size <= max_bytes:
         return [source]
     seconds = await duration(source)
-    interval = seconds * max_bytes / size * 0.8
+    keyframes = await keyframe_offsets(source)
+    reserve = min(64 * 1024, max(1, max_bytes // 100))
+    budget = max_bytes - reserve
     directory.mkdir()
     for _ in range(8):
+        cuts = plan_cuts(keyframes, size, budget)
+        if not cuts:
+            raise VideoPreparationError("The video has no usable split boundaries.")
         for path in directory.glob("part-*.mp4"):
             path.unlink()
         try:
@@ -98,8 +155,7 @@ async def split_video(source: Path, directory: Path, max_bytes: int = SEGMENT_BY
                 "-protocol_whitelist", "file,pipe", "-f", "mov", "-enable_drefs", "0", "-i", str(source),
                 "-map", "0:v:0", "-map", "0:a:0?", "-c", "copy",
                 "-f", "segment", "-segment_times",
-                ",".join(str(max(0.1, interval) * i) for i in range(1, MAX_SEGMENTS)
-                         if max(0.1, interval) * i < seconds),
+                ",".join(f"{cut:.6f}" for cut in cuts),
                 "-reset_timestamps", "1", "-segment_format", "mp4",
                 "-segment_format_options", "movflags=+faststart",
                 str(directory / "part-%03d.mp4"),
@@ -117,7 +173,10 @@ async def split_video(source: Path, directory: Path, max_bytes: int = SEGMENT_BY
             if abs(total - seconds) > max(2.0, len(parts) * 0.25):
                 raise VideoPreparationError("Video segment durations did not preserve the full source.")
             return parts
-        if interval <= 0.1:
+        overshoot = max(sizes) - max_bytes
+        if overshoot < 0:
             break
-        interval = max(0.1, interval * min(0.5, max_bytes / max(sizes) * 0.8))
+        budget -= overshoot + reserve
+        if budget <= 0:
+            break
     raise VideoPreparationError("This video's keyframes prevent safe size-bounded splitting.")

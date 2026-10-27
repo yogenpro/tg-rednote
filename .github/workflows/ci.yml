@@ -41,7 +41,10 @@ jobs:
       - name: Test
         # The suite touches no network, no Telegram and no sidecar, so a
         # failure here is a real failure and not the weather.
-        run: python -m pytest tests -q
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends ffmpeg
+          python -m pytest tests -q
 
   image:
     # The gate: nothing reaches the registry until the suite is green on both

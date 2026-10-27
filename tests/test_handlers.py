@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import sys
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 import pytest
@@ -11,7 +12,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "bot"))
 
 from app.config import Config  # noqa: E402
 from app.handlers import Bot, message_candidates  # noqa: E402
-from app.media import MEDIA_GROUP_LIMIT, SendReport  # noqa: E402
+from app.media import MEDIA_GROUP_LIMIT, SendReport, delivery_groups  # noqa: E402
 from app.state import State  # noqa: E402
 from app.telegram import TelegramError  # noqa: E402
 from app.xhs import Note, XhsError  # noqa: E402
@@ -72,6 +73,10 @@ class FakeDownloader:
 
 
 class FakeSender:
+    @asynccontextmanager
+    async def prepare(self, items):
+        yield items
+
     def __init__(self):
         self.sends = []
         self.streaming = False
@@ -125,9 +130,7 @@ class ChunkingSender(FakeSender):
     ):
         self.sends.append((chat_id, list(items), caption, reply_to, part_from, list(followup_captions or [])))
         followup = list(followup_captions or [])
-        groups = [
-            items[i : i + MEDIA_GROUP_LIMIT] for i in range(0, len(items), MEDIA_GROUP_LIMIT)
-        ]
+        groups = delivery_groups(items)
         total = part_total if part_total is not None else len(groups)
         parts = []
         first = None
@@ -1010,7 +1013,7 @@ async def test_published_index_survives_a_restart(tmp_path):
 async def test_a_channel_refusal_tells_the_submitter_and_the_owner(tmp_path):
     bot, telegram, state = channel_bot(tmp_path)
 
-    class Refusing:
+    class Refusing(FakeSender):
         sends = []
 
         async def send(
@@ -1199,6 +1202,60 @@ async def test_chatter_in_the_discussion_group_is_ignored(tmp_path):
 
 
 # ---- continuation links ----------------------------------------------
+
+@pytest.mark.asyncio
+async def test_video_segments_use_album_caption_budgets_and_continuation_links(tmp_path):
+    from app.xhs import MediaItem
+    from app.media import tg_len
+    from html import unescape
+    import re
+
+    note = Note(note_id="video-note", kind="video", title="Video", desc="word " * 400,
+                video="https://cdn/video", url="https://www.xiaohongshu.com/explore/video-note")
+    bot, telegram, state = channel_bot(tmp_path, downloader=FakeDownloader(note))
+
+    class SegmentedSender(ChunkingSender):
+        cleaned = False
+
+        @asynccontextmanager
+        async def prepare(self, items):
+            try:
+                yield [MediaItem("video", f"segment-{i}", continuation=True) for i in range(3)]
+            finally:
+                self.cleaned = True
+
+    sender = SegmentedSender()
+    sender.next_message_id = 42
+    bot.sender = sender
+    await bot.handle_update(message("http://xhslink.com/o/video"))
+    assert sender.cleaned
+    assert len(sender.reports[0].parts) == 3
+    assert len(sender.sends[0][5]) == 2  # overflow rides follow-up video captions
+    assert [mid for _, mid, _ in telegram.edits] == [42, 43]
+    assert "https://t.me/mychannel/43" in telegram.edits[0][2]
+    assert "https://t.me/mychannel/44" in telegram.edits[1][2]
+    for _, _, caption in telegram.edits:
+        assert tg_len(unescape(re.sub(r"<[^>]+>", "", caption))) <= 1024
+    assert state.published(note.note_id)["message_id"] == 42
+
+
+@pytest.mark.asyncio
+async def test_video_preparation_failure_preserves_retry_without_marking_published(tmp_path):
+    from app.video import VideoPreparationError
+    bot, telegram, state = channel_bot(tmp_path)
+
+    class BrokenPreparation(FakeSender):
+        @asynccontextmanager
+        async def prepare(self, items):
+            raise VideoPreparationError("The video could not be processed safely.")
+            yield items
+
+    bot.sender = BrokenPreparation()
+    outcome = await bot._handle_link(None, None, "http://xhslink.com/o/video", 1, announce_to=(-55, 9))
+    assert outcome == "refused" and not bot.sender.sends
+    assert len(state.failures()) == 1
+    assert state.published(NOTE.note_id) is None
+    assert "could not be processed safely" in telegram.texts
 
 @pytest.mark.asyncio
 async def test_a_post_with_overflow_links_to_its_continuation(tmp_path):

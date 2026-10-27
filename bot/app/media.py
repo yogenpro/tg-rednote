@@ -14,8 +14,13 @@ from __future__ import annotations
 import asyncio
 import logging
 import mimetypes
-from dataclasses import dataclass, field
+import hashlib
+import shutil
+import tempfile
+from contextlib import asynccontextmanager
+from dataclasses import dataclass, field, replace
 from html import escape
+from pathlib import Path
 from urllib.parse import urlsplit
 from typing import Iterable, Iterator
 
@@ -25,6 +30,7 @@ from .cache import LRU
 from .logs import fields
 from .telegram import CAPTION_LIMIT, MEDIA_GROUP_LIMIT, MESSAGE_LIMIT, Telegram, TelegramError
 from .xhs import MediaItem, Note
+from .video import SEGMENT_BYTES, SOURCE_BYTES, VideoPreparationError, download_video, split_video
 
 log = logging.getLogger(__name__)
 
@@ -134,6 +140,21 @@ def build_caption(
 def chunk(items: list[MediaItem], size: int = MEDIA_GROUP_LIMIT) -> Iterator[list[MediaItem]]:
     for start in range(0, len(items), size):
         yield items[start : start + size]
+
+
+def delivery_groups(items: list[MediaItem]) -> list[list[MediaItem]]:
+    """Photo albums retain ten-item groups; each video segment is a post."""
+    groups: list[list[MediaItem]] = []
+    pending: list[MediaItem] = []
+    for item in items:
+        if item.continuation:
+            groups.extend(chunk(pending))
+            pending = []
+            groups.append([item])
+        else:
+            pending.append(item)
+    groups.extend(chunk(pending))
+    return groups
 
 
 def first_message_id(result) -> int | None:
@@ -265,6 +286,7 @@ class MediaSender:
         self._refused: set[str] = set()
         self._max_bytes = max_bytes
         self._file_ids = file_ids if file_ids is not None else LRU(maxsize=512)
+        self._video_slot = asyncio.Semaphore(1)
         # A download is a fetch like any other: when the bot's traffic is
         # routed somewhere specific, the bytes go the same way as the page that
         # named them — XHS's CDN and the forum's alike.
@@ -277,6 +299,57 @@ class MediaSender:
 
     async def aclose(self) -> None:
         await self._client.aclose()
+
+    @asynccontextmanager
+    async def prepare(self, items: list[MediaItem]):
+        """Prepare videos before caption budgeting, retaining files until send ends."""
+        if self._configured_mode == "url":
+            yield items
+            return
+        target = min(SEGMENT_BYTES, self._max_bytes)
+        needed = [item for item in items if item.kind == "video" and not item.local_path
+                  and not self._file_ids.get(item.url) and (not item.size or item.size > target)]
+        if not needed:
+            yield items
+            return
+        async with self._video_slot:
+            with tempfile.TemporaryDirectory(prefix="tg-video-") as temporary:
+                root = Path(temporary)
+                if shutil.disk_usage(root).free < SOURCE_BYTES * 2:
+                    raise VideoPreparationError("Not enough temporary space to prepare video segments.")
+                prepared: list[MediaItem] = []
+                used = 0
+                for index, item in enumerate(items):
+                    if item not in needed:
+                        prepared.append(item)
+                        continue
+                    candidates = [(item.url, item.size), *item.alternatives]
+                    fits = [(url, size) for url, size in candidates if 0 < size <= self._max_bytes]
+                    known = [(url, size) for url, size in candidates if size > 0]
+                    url, _ = max(fits, key=lambda x: x[1]) if fits else (
+                        min(known, key=lambda x: x[1]) if known else (item.url, 0)
+                    )
+                    source = root / f"source-{index}.mp4"
+                    used += await download_video(self._client, url, source, SOURCE_BYTES - used)
+                    try:
+                        async with asyncio.timeout(180):
+                            parts = await split_video(source, root / f"parts-{index}", target)
+                    except TimeoutError:
+                        raise VideoPreparationError("Video processing exceeded its time limit.") from None
+                    split = len(parts) > 1
+                    for part_index, path in enumerate(parts):
+                        identity = item.url
+                        if split:
+                            digest = hashlib.sha256(path.read_bytes()).hexdigest()
+                            identity += f"#tg-segment-v1-{part_index}-{digest}"
+                        prepared.append(replace(
+                            item, url=identity, alternatives=(), size=path.stat().st_size,
+                            local_path=path, continuation=split,
+                        ))
+                    if split:
+                        log.info("prepared video as %d continuation posts", len(parts),
+                                 extra=fields(event="video_split", segments=len(parts), source_bytes=source.stat().st_size))
+                yield prepared
 
     def set_headers(self, **headers: str) -> None:
         """Update the download headers in place.
@@ -415,9 +488,14 @@ class MediaSender:
             cached = self._file_ids.get(item.url)
             if cached:
                 entry["media"] = cached
-            elif self._needs_upload(item.url):
+            elif self._needs_upload(item.url) or item.continuation:
                 try:
-                    payload, content_type, _u = await self._fetch_within_budget(item)
+                    if item.local_path:
+                        if item.local_path.stat().st_size > self._max_bytes:
+                            raise VideoPreparationError("A prepared video exceeds the upload limit.")
+                        payload, content_type = item.local_path.read_bytes(), "video/mp4"
+                    else:
+                        payload, content_type, _u = await self._fetch_within_budget(item)
                     if item.kind == "photo":
                         payload, content_type = await self._fit_photo(item, payload, content_type)
                 except MediaTooLarge as exc:
@@ -465,7 +543,18 @@ class MediaSender:
         part_total: int | None = None,
         followup_captions: list[str] | None = None,
     ) -> SendReport:
-        """Send an album, chunked to Telegram's ten-item limit.
+        async with self.prepare(items) as prepared:
+            return await self._send_prepared(
+                chat_id, prepared, caption, reply_to=reply_to, part_from=part_from,
+                part_total=part_total, followup_captions=followup_captions,
+            )
+
+    async def _send_prepared(
+        self, chat_id: int | str, items: list[MediaItem], caption: str, *,
+        reply_to: int | None = None, part_from: int = 1, part_total: int | None = None,
+        followup_captions: list[str] | None = None,
+    ) -> SendReport:
+        """Send albums and video continuations in order.
 
         `part_from`/`part_total` let one album be split across two destinations
         — a channel post and its discussion thread — while the "[2/3]" markers
@@ -480,7 +569,7 @@ class MediaSender:
         """
         report = SendReport()
         followup = [piece for piece in (followup_captions or []) if piece]
-        groups = list(chunk(items))
+        groups = delivery_groups(items)
         total = part_total if part_total is not None else len(groups)
 
         for offset, group in enumerate(groups):

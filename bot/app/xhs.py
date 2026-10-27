@@ -488,6 +488,21 @@ class XhsDownloader:
             response.raise_for_status()
             body = response.json()
         except httpx.HTTPError as exc:
+            # A parser crash can return HTTP 500 while the note's mobile page
+            # remains readable. Try the same backstop as an ordinary refusal,
+            # including redirects/client errors and transport failures.
+            reason = (
+                f"HTTP {exc.response.status_code}"
+                if isinstance(exc, httpx.HTTPStatusError) else type(exc).__name__
+            )
+            fallback = await self.from_page(page)
+            if fallback:
+                log.info(
+                    "sidecar failed (%s); read %s off the page instead",
+                    reason, fallback.note_id,
+                    extra=fields(event="page_fallback", note=fallback.note_id, reason=reason),
+                )
+                return fallback
             # Never let a traceback carry the cookie back up the stack (PLAN §7).
             raise XhsError("network", f"downloader unreachable: {type(exc).__name__}") from None
         except ValueError:

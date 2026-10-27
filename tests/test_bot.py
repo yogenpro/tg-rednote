@@ -1593,6 +1593,63 @@ async def test_detail_falls_back_to_the_page_when_the_api_refuses():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("status", [301, 400, 401, 403, 404, 429, 500, 502, 503])
+@pytest.mark.parametrize("page_works", [True, False])
+async def test_detail_tries_mobile_page_after_any_unsuccessful_status(status, page_works, caplog):
+    """A live sidecar parser crash returned 500 for a readable mobile note."""
+    from app.xhs import XhsDownloader, XhsError
+
+    shared = "https://www.rednote.com/explore/650a?xsec_token=signed"
+    pages = []
+    cookie = "private-session-cookie"
+    downloader = XhsDownloader("http://sidecar", proxy="http://home:8888")
+
+    def api(request):
+        payload = json.loads(request.content)
+        assert payload["cookie"] == cookie
+        assert payload["proxy"] == "http://home:8888"
+        assert payload["url"] == shared.replace("rednote.com", "xiaohongshu.com")
+        return httpx.Response(status, request=request, text=cookie)
+
+    def page(request):
+        pages.append(str(request.url))
+        assert "iPhone" in request.headers["User-Agent"]
+        return httpx.Response(
+            200 if page_works else 404, request=request,
+            text=_note_page(IMAGE_PAGE) if page_works else "unavailable",
+        )
+
+    await downloader.aclose()
+    downloader._api = httpx.AsyncClient(transport=httpx.MockTransport(api))
+    from app.xhs import BROWSER_HEADERS
+    downloader._client = httpx.AsyncClient(
+        transport=httpx.MockTransport(page), headers=BROWSER_HEADERS,
+    )
+    try:
+        if page_works:
+            with caplog.at_level("INFO", logger="app.xhs"):
+                note = await downloader.detail(shared, cookie=cookie)
+            assert note.note_id == "650a"
+            assert len(note.photos) == 2
+            assert note.from_page
+            assert note.page_url == shared
+            assert any(
+                getattr(r, "fields", {}).get("reason") == f"HTTP {status}"
+                for r in caplog.records
+            )
+        else:
+            with pytest.raises(XhsError) as caught:
+                await downloader.detail(shared, cookie=cookie)
+            assert caught.value.kind == "network"
+            assert str(caught.value) == "downloader unreachable: HTTPStatusError"
+            assert caught.value.__suppress_context__
+        assert pages[0] == shared
+        assert cookie not in caplog.text
+    finally:
+        await downloader.aclose()
+
+
+@pytest.mark.asyncio
 async def test_the_original_error_stands_when_the_page_is_no_help():
     import httpx
 

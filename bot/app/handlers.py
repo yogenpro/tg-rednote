@@ -28,7 +28,7 @@ from .acres import looks_like_cookie as looks_like_acres_cookie
 from .cache import LRU
 from .config import Config
 from .logs import current_rid, fields, new_rid
-from .login import LoginClient, LoginFlow
+from .login import LoginClient, LoginFlow, LoginSaveError
 from .comments import (
     comment_albums,
     fit_into_caption,
@@ -677,7 +677,17 @@ class Bot:
     # ---- cookie ------------------------------------------------------
 
     def _save_login_cookie(self, cookie: str) -> None:
-        self.state.set_cookie(cookie)
+        previous = self.state.data.copy()
+        try:
+            self.state.set_cookie(cookie)
+        except Exception:
+            # A failed write must not leave a cookie only in memory. Reconcile
+            # against whichever state the atomic rename actually committed.
+            self.state.data = previous
+            with contextlib.suppress(Exception, SystemExit):
+                self.state.load()
+            self.xhs.set_cookie(self.state.cookie)
+            raise LoginSaveError("Could not persist login") from None
         self.xhs.set_cookie(cookie)
 
     async def _handle_cookie(self, chat_id: int, user_id: int, message_id: int | None, text: str) -> None:

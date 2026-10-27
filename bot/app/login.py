@@ -12,6 +12,10 @@ class LoginError(Exception):
     pass
 
 
+class LoginSaveError(Exception):
+    pass
+
+
 class LoginClient:
     def __init__(self, socket_path: str):
         self.socket_path = socket_path
@@ -120,6 +124,8 @@ class LoginFlow:
             raise
         except TimeoutError:
             outcome = "QR login timed out. The existing cookie was kept. Use /login to try again."
+        except LoginSaveError:
+            outcome = "Sign-in was confirmed, but saving the cookie failed. Check /status before trying /login again."
         except Exception:
             # Neither browser/IPC errors nor Telegram errors may expose cookies.
             pass

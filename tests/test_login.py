@@ -279,6 +279,26 @@ async def test_concurrent_login_commands_create_only_one_remote_session():
     assert client.calls[-1] == ("cancel", "capability") and flow.task is None
 
 
+async def test_cookie_storage_failure_restores_committed_state_and_reports_separately(tmp_path, monkeypatch):
+    bot, tg, state = make_bot(tmp_path, owner=1)
+    state.set_cookie("web_session=old")
+    bot.xhs.set_cookie(state.cookie)
+    client = Client({"status": "success", "cookie": COOKIE})
+    client.release.set()
+    bot.login = LoginFlow(client, tg, bot._save_login_cookie, interval=0)
+
+    def fail():
+        raise OSError("This error must not expose " + COOKIE)
+
+    monkeypatch.setattr(state, "save", fail)
+    await bot.handle_update(message("/login"))
+    await bot.login.task
+    assert state.cookie == bot.xhs.cookie == "web_session=old"
+    assert "saving the cookie failed" in tg.texts
+    assert COOKIE not in tg.texts
+    await bot.aclose()
+
+
 async def test_absent_helper_reports_safe_error(tmp_path):
     tg = Telegram()
     flow = LoginFlow(LoginClient(str(tmp_path / "absent.sock")), tg, lambda _: pytest.fail("unexpected save"))

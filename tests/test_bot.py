@@ -1761,18 +1761,19 @@ async def test_an_oversized_video_falls_back_to_a_rendition_that_fits(monkeypatc
         "https://cdn/original.mp4",
         alternatives=(("https://cdn/h264.mp4", 62_213_884), ("https://cdn/h265.mp4", 37_938_283)),
     )
-    report = await sender.send(1, [item], "cap")
+    payload, content_type, selected = await sender._fetch_within_budget(item)
     await sender.aclose()
 
-    assert report.sent == 1 and report.skipped == []
+    assert payload == b"bytes" and content_type == "video/mp4"
+    assert selected == "https://cdn/h265.mp4"
     # Original first, then the largest rendition that fits — not the smallest
     # available, and the one known to be too big is never even attempted.
     assert fetched == ["https://cdn/original.mp4", "https://cdn/h265.mp4"]
 
 
 @pytest.mark.asyncio
-async def test_a_video_with_no_rendition_that_fits_is_skipped(monkeypatch):
-    """Per the brief: if nothing fits, skip it — don't post a degraded stand-in."""
+async def test_the_low_level_upload_budget_refuses_a_video_without_a_fitting_rendition(monkeypatch):
+    """The video preparation layer handles splitting before this upload budget."""
     telegram = FakeTelegram(fail_urls=True)
     sender = MediaSender(telegram, mode="auto", max_bytes=50 * 1024 * 1024)
 
@@ -1782,11 +1783,9 @@ async def test_a_video_with_no_rendition_that_fits_is_skipped(monkeypatch):
     monkeypatch.setattr(sender, "_download", fake_download)
 
     item = MediaItem("video", "https://cdn/a.mp4", alternatives=(("https://cdn/b.mp4", 80_000_000),))
-    report = await sender.send(1, [item], "cap")
+    with pytest.raises(MediaTooLarge):
+        await sender._fetch_within_budget(item)
     await sender.aclose()
-
-    assert report.sent == 0
-    assert "too large" in report.skipped[0]
 
 
 def test_variants_are_read_off_the_page_with_their_sizes():

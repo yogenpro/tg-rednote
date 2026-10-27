@@ -7,6 +7,7 @@ import pytest
 
 def pytest_configure(config):
     config.addinivalue_line("markers", "asyncio: run this coroutine test on a fresh event loop")
+    config.addinivalue_line("markers", "ffmpeg: offline media regression requiring ffmpeg and ffprobe")
 
 
 @pytest.hookimpl(tryfirst=True)

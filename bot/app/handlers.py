@@ -35,7 +35,8 @@ from .comments import (
     render_comments,
     strip_tags,
 )
-from .media import MEDIA_GROUP_LIMIT, MediaSender, build_caption, tg_len, tg_truncate
+from .media import MEDIA_GROUP_LIMIT, MediaSender, build_caption, delivery_groups, tg_len, tg_truncate
+from .video import VideoPreparationError
 from .state import State, generate_pairing_code
 from .telegraph import Telegraph, TelegraphError, trim
 from .telegram import CAPTION_LIMIT, MESSAGE_LIMIT, Telegram, TelegramError
@@ -1426,207 +1427,219 @@ class Bot:
         # the sender is handed items that were assembled before the fetch.
         items = note.media(self.config.live_photos)
 
-        # A split album prefixes "[1/2] "; keep room so the caption still fits.
-        parts = -(-len(items) // MEDIA_GROUP_LIMIT)
-        marker = len(f"[{parts}/{parts}] ") if parts > 1 else 0
-        budget = CAPTION_LIMIT - marker
-        # The note's own text has first claim on the caption. Comments only get
-        # what it leaves — and if the text spills into a follow-up message at
-        # all, they move there wholesale rather than splitting the thread.
-        caption, overflow = build_caption(
-            note, tags=self.config.tags_in_caption, reserve=marker
-        )
-        # Reserve room for `continues ↓` only when normal note/comment text
-        # actually continues. Comment-picture albums are replies to that text,
-        # not members of its continuation chain, so pictures alone do not spend
-        # caption room on a link they do not need.
-        continuation_reserved = bool(channel and parts > 1)
-        if continuation_reserved:
-            caption, overflow = build_caption(
-                note, tags=self.config.tags_in_caption, reserve=marker + CONTINUED_COST
-            )
-        if overflow:
-            if channel and not continuation_reserved:
+        try:
+            async with self.sender.prepare(items) as items:
+                # A split album prefixes "[1/2] "; keep room so the caption still fits.
+                parts = len(delivery_groups(items))
+                marker = len(f"[{parts}/{parts}] ") if parts > 1 else 0
+                budget = CAPTION_LIMIT - marker
+                # The note's own text has first claim on the caption. Comments only get
+                # what it leaves — and if the text spills into a follow-up message at
+                # all, they move there wholesale rather than splitting the thread.
                 caption, overflow = build_caption(
-                    note, tags=self.config.tags_in_caption, reserve=marker + CONTINUED_COST
+                    note, tags=self.config.tags_in_caption, reserve=marker
                 )
-                continuation_reserved = True
-            trailing = comments
-        else:
-            caption, trailing = fit_into_caption(
-                caption,
-                comments,
-                limit=budget - (CONTINUED_COST if continuation_reserved else 0),
-            )
-            if channel and trailing and not continuation_reserved:
-                caption, overflow = build_caption(
-                    note, tags=self.config.tags_in_caption, reserve=marker + CONTINUED_COST
-                )
-                continuation_reserved = True
+                # Reserve room for `continues ↓` only when normal note/comment text
+                # actually continues. Comment-picture albums are replies to that text,
+                # not members of its continuation chain, so pictures alone do not spend
+                # caption room on a link they do not need.
+                continuation_reserved = bool(channel and parts > 1)
+                if continuation_reserved:
+                    caption, overflow = build_caption(
+                        note, tags=self.config.tags_in_caption, reserve=marker + CONTINUED_COST
+                    )
                 if overflow:
+                    if channel and not continuation_reserved:
+                        caption, overflow = build_caption(
+                            note, tags=self.config.tags_in_caption, reserve=marker + CONTINUED_COST
+                        )
+                        continuation_reserved = True
                     trailing = comments
                 else:
                     caption, trailing = fit_into_caption(
-                        caption, comments, limit=budget - CONTINUED_COST
+                        caption,
+                        comments,
+                        limit=budget - (CONTINUED_COST if continuation_reserved else 0),
+                    )
+                    if channel and trailing and not continuation_reserved:
+                        caption, overflow = build_caption(
+                            note, tags=self.config.tags_in_caption, reserve=marker + CONTINUED_COST
+                        )
+                        continuation_reserved = True
+                        if overflow:
+                            trailing = comments
+                        else:
+                            caption, trailing = fit_into_caption(
+                                caption, comments, limit=budget - CONTINUED_COST
+                            )
+
+                # Where the album goes: the channel if we're curating one, else back to
+                # whoever asked. A channel post can't reply to a user's message.
+                target = channel["id"] if channel else chat_id
+                if target is None:  # a group submission with nowhere to publish
+                    return "skipped"
+                reply_to = None if channel else message_id
+
+                # The follow-up text: the note's overflow, then comments. When the
+                # album itself splits, the groups after the first are captions in
+                # search of text — a photo-overflow group carrying only its "[2/2]"
+                # marker is a message spent on nothing — so the overflow flows into
+                # those captions first and only what is left becomes a message.
+                # (Seen live on a 15-photo note: /gradient_canopy/1137 sent [2/2] with
+                # an 18-unit caption and then a third message for the overflow.)
+                carry_budgets = (
+                    [CAPTION_LIMIT - marker - (CONTINUED_COST if channel else 0)] * (parts - 1)
+                    if parts > 1
+                    else []
+                )
+                room = MESSAGE_LIMIT - (CONTINUED_COST if channel else 0)
+                pieces = self._follow_up(overflow, trailing, budgets=carry_budgets, limit=room)
+                carry = pieces[: len(carry_budgets)]
+
+                action = "upload_video" if any(item.kind == "video" for item in items) else "upload_photo"
+                try:
+                    async with self._busy(chat_id, action) if chat_id else _nothing():
+                        report = await self.sender.send(
+                            target, items, caption, reply_to=reply_to, followup_captions=carry
+                        )
+                except TelegramError as exc:
+                    log.exception("send failed for note %s", note.note_id)
+                    await self._reply(
+                        chat_id,
+                        ("The channel refused the post: " if channel else "Telegram refused the media: ")
+                        + f"<code>{escape(exc.description)}</code>",
+                        reply_to=message_id,
+                    )
+                    if channel:
+                        await self._notify_owner(
+                            "⚠️ A submission could not be published to "
+                            f"<b>{escape(channel['title'])}</b>: "
+                            f"<code>{escape(exc.description)}</code>"
+                        )
+                    if announce_to:
+                        self._remember_failure(link, user_id, announce_to, "refused")
+                    return "refused"
+
+                log.info(
+                    "delivered %d item(s) in %.1fs via %s%s",
+                    report.sent,
+                    time.monotonic() - started,
+                    "upload" if report.uploaded else "cached file_id/url",
+                    f", skipped {len(report.skipped)}" if report.skipped else "",
+                    extra=fields(
+                        event="delivery",
+                        note=note.note_id,
+                        items=report.sent,
+                        seconds=round(time.monotonic() - started, 1),
+                        mode="upload" if report.uploaded else "url",
+                        skipped=len(report.skipped),
+                    ),
+                )
+                if report.skipped:
+                    # The reasons used to go only to the submitter's chat, which a group
+                    # submission does not have — so they went nowhere at all.
+                    log.warning(
+                        "note %s skipped %s", note.note_id or "?", "; ".join(report.skipped),
+                        extra=fields(event="media_skipped", note=note.note_id, count=len(report.skipped)),
+                    )
+                if not report.sent:
+                    log.error(
+                        "nothing was delivered for note %s", note.note_id or "?",
+                        extra=fields(event="delivery_empty", note=note.note_id),
+                    )
+                    await self._reply(
+                        chat_id,
+                        "I couldn't send any of that note's media: "
+                        + "; ".join(escape(s) for s in report.skipped),
+                        reply_to=message_id,
+                    )
+                    if announce_to:
+                        self._remember_failure(link, user_id, announce_to, "empty")
+                    return "empty"
+                # Everything else follows in the same chat, chained onto the post —
+                # text the album's captions could not carry (a dropped group hands
+                # its share back unused) plus whatever never fit in a caption.
+                chain: list[tuple[int, str, bool]] = [(mid, cap, True) for mid, cap in report.parts]
+                previous = report.parts[-1][0] if report.parts else report.first_message_id
+                for piece in report.unused_captions + pieces[len(carry) :]:
+                    sent = await self._send_and_track(target, piece, reply_to=previous)
+                    if sent:
+                        chain.append((sent, piece, False))
+                        previous = sent
+
+                # A comment's pictures, each set under its author's name. They all
+                # reply to the note itself — or to the message that carries comments
+                # after caption overflow — instead of forming an unrelated reply chain.
+                # A refused or empty album costs its pictures, not the delivery: the
+                # note is already out.
+                comment_parent = previous
+                links: dict[str, str] = {}
+                delivered = 0
+                albums_sent = 0
+                for caption, urls in comment_albums(comments):
+                    try:
+                        async with self._busy(chat_id, "upload_photo") if chat_id else _nothing():
+                            part = await self.sender.send(
+                                target,
+                                [MediaItem("photo", url) for url in urls],
+                                caption,
+                                reply_to=comment_parent,
+                            )
+                    except TelegramError as exc:
+                        log.warning(
+                            "comment pictures for %s were refused: %s",
+                            note.note_id or "?", exc.description,
+                            extra=fields(
+                                event="media_skipped", note=note.note_id, count=len(urls)
+                            ),
+                        )
+                        continue
+                    if not part.sent:
+                        continue
+                    delivered += part.sent
+                    albums_sent += 1
+                    # Each entry from comment_albums is one Telegram-sized group, so
+                    # the marker for its lead image names precisely this album.
+                    if channel and part.first_message_id:
+                        where = self.message_link(part.first_message_id)
+                        if where:
+                            links[urls[0]] = where
+                if delivered:
+                    log.info(
+                        "comment pictures for %s: %d photo(s) in %d album(s)",
+                        note.note_id or "?", delivered, albums_sent,
+                        extra=fields(
+                            event="comment_gallery", note=note.note_id,
+                            images=delivered, albums=albums_sent,
+                        ),
                     )
 
-        # Where the album goes: the channel if we're curating one, else back to
-        # whoever asked. A channel post can't reply to a user's message.
-        target = channel["id"] if channel else chat_id
-        if target is None:  # a group submission with nowhere to publish
-            return "skipped"
-        reply_to = None if channel else message_id
+                # A reply chain is invisible once a message is forwarded out of the
+                # channel, so each normal message also carries a link to the next one.
+                # Comment-image albums rely on their reply parent instead; marker edits
+                # are folded into this pass without adding them to the chain.
+                if channel and (len(chain) > 1 or links):
+                    await self._link_the_chain(target, chain, image_links=links)
 
-        # The follow-up text: the note's overflow, then comments. When the
-        # album itself splits, the groups after the first are captions in
-        # search of text — a photo-overflow group carrying only its "[2/2]"
-        # marker is a message spent on nothing — so the overflow flows into
-        # those captions first and only what is left becomes a message.
-        # (Seen live on a 15-photo note: /gradient_canopy/1137 sent [2/2] with
-        # an 18-unit caption and then a third message for the overflow.)
-        carry_budgets = (
-            [CAPTION_LIMIT - marker - (CONTINUED_COST if channel else 0)] * (parts - 1)
-            if parts > 1
-            else []
-        )
-        room = MESSAGE_LIMIT - (CONTINUED_COST if channel else 0)
-        pieces = self._follow_up(overflow, trailing, budgets=carry_budgets, limit=room)
-        carry = pieces[: len(carry_budgets)]
+                if report.skipped:
+                    await self._reply(chat_id, "Skipped: " + "; ".join(escape(s) for s in report.skipped))
 
-        action = "upload_video" if any(item.kind == "video" for item in items) else "upload_photo"
-        try:
-            async with self._busy(chat_id, action) if chat_id else _nothing():
-                report = await self.sender.send(
-                    target, items, caption, reply_to=reply_to, followup_captions=carry
-                )
-        except TelegramError as exc:
-            log.exception("send failed for note %s", note.note_id)
-            await self._reply(
-                chat_id,
-                ("The channel refused the post: " if channel else "Telegram refused the media: ")
-                + f"<code>{escape(exc.description)}</code>",
-                reply_to=message_id,
-            )
+                if channel:
+                    where, in_reply_to = announce_to or (chat_id, message_id)
+                    await self._announce_published(
+                        where, in_reply_to, note.note_id, report.first_message_id
+                    )
+                return "published"
+
+        except (VideoPreparationError, OSError) as exc:
+            reason = str(exc) if isinstance(exc, VideoPreparationError) else "Temporary video storage is unavailable."
+            log.warning("video preparation failed: %s", reason, extra=fields(event="video_prepare_failed"))
+            await self._reply(chat_id, reason, reply_to=message_id)
             if channel:
-                await self._notify_owner(
-                    "⚠️ A submission could not be published to "
-                    f"<b>{escape(channel['title'])}</b>: "
-                    f"<code>{escape(exc.description)}</code>"
-                )
+                await self._notify_owner("⚠️ A video submission could not be prepared: " + escape(reason))
             if announce_to:
                 self._remember_failure(link, user_id, announce_to, "refused")
             return "refused"
-
-        log.info(
-            "delivered %d item(s) in %.1fs via %s%s",
-            report.sent,
-            time.monotonic() - started,
-            "upload" if report.uploaded else "cached file_id/url",
-            f", skipped {len(report.skipped)}" if report.skipped else "",
-            extra=fields(
-                event="delivery",
-                note=note.note_id,
-                items=report.sent,
-                seconds=round(time.monotonic() - started, 1),
-                mode="upload" if report.uploaded else "url",
-                skipped=len(report.skipped),
-            ),
-        )
-        if report.skipped:
-            # The reasons used to go only to the submitter's chat, which a group
-            # submission does not have — so they went nowhere at all.
-            log.warning(
-                "note %s skipped %s", note.note_id or "?", "; ".join(report.skipped),
-                extra=fields(event="media_skipped", note=note.note_id, count=len(report.skipped)),
-            )
-        if not report.sent:
-            log.error(
-                "nothing was delivered for note %s", note.note_id or "?",
-                extra=fields(event="delivery_empty", note=note.note_id),
-            )
-            await self._reply(
-                chat_id,
-                "I couldn't send any of that note's media: "
-                + "; ".join(escape(s) for s in report.skipped),
-                reply_to=message_id,
-            )
-            if announce_to:
-                self._remember_failure(link, user_id, announce_to, "empty")
-            return "empty"
-        # Everything else follows in the same chat, chained onto the post —
-        # text the album's captions could not carry (a dropped group hands
-        # its share back unused) plus whatever never fit in a caption.
-        chain: list[tuple[int, str, bool]] = [(mid, cap, True) for mid, cap in report.parts]
-        previous = report.parts[-1][0] if report.parts else report.first_message_id
-        for piece in report.unused_captions + pieces[len(carry) :]:
-            sent = await self._send_and_track(target, piece, reply_to=previous)
-            if sent:
-                chain.append((sent, piece, False))
-                previous = sent
-
-        # A comment's pictures, each set under its author's name. They all
-        # reply to the note itself — or to the message that carries comments
-        # after caption overflow — instead of forming an unrelated reply chain.
-        # A refused or empty album costs its pictures, not the delivery: the
-        # note is already out.
-        comment_parent = previous
-        links: dict[str, str] = {}
-        delivered = 0
-        albums_sent = 0
-        for caption, urls in comment_albums(comments):
-            try:
-                async with self._busy(chat_id, "upload_photo") if chat_id else _nothing():
-                    part = await self.sender.send(
-                        target,
-                        [MediaItem("photo", url) for url in urls],
-                        caption,
-                        reply_to=comment_parent,
-                    )
-            except TelegramError as exc:
-                log.warning(
-                    "comment pictures for %s were refused: %s",
-                    note.note_id or "?", exc.description,
-                    extra=fields(
-                        event="media_skipped", note=note.note_id, count=len(urls)
-                    ),
-                )
-                continue
-            if not part.sent:
-                continue
-            delivered += part.sent
-            albums_sent += 1
-            # Each entry from comment_albums is one Telegram-sized group, so
-            # the marker for its lead image names precisely this album.
-            if channel and part.first_message_id:
-                where = self.message_link(part.first_message_id)
-                if where:
-                    links[urls[0]] = where
-        if delivered:
-            log.info(
-                "comment pictures for %s: %d photo(s) in %d album(s)",
-                note.note_id or "?", delivered, albums_sent,
-                extra=fields(
-                    event="comment_gallery", note=note.note_id,
-                    images=delivered, albums=albums_sent,
-                ),
-            )
-
-        # A reply chain is invisible once a message is forwarded out of the
-        # channel, so each normal message also carries a link to the next one.
-        # Comment-image albums rely on their reply parent instead; marker edits
-        # are folded into this pass without adding them to the chain.
-        if channel and (len(chain) > 1 or links):
-            await self._link_the_chain(target, chain, image_links=links)
-
-        if report.skipped:
-            await self._reply(chat_id, "Skipped: " + "; ".join(escape(s) for s in report.skipped))
-
-        if channel:
-            where, in_reply_to = announce_to or (chat_id, message_id)
-            await self._announce_published(
-                where, in_reply_to, note.note_id, report.first_message_id
-            )
-        return "published"
 
     @staticmethod
     def _follow_up(

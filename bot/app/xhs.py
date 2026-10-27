@@ -16,6 +16,7 @@ import re
 from urllib.parse import unquote
 from dataclasses import dataclass, field
 from typing import Any
+from pathlib import Path
 
 import httpx
 
@@ -205,6 +206,9 @@ class MediaItem:
     url: str
     # Smaller renditions to fall back on if this one is too big to upload.
     alternatives: tuple[tuple[str, int], ...] = ()
+    size: int = 0
+    local_path: Path | None = field(default=None, repr=False)
+    continuation: bool = False
 
 
 @dataclass
@@ -234,7 +238,8 @@ class Note:
             if not self.video:
                 return []
             spares = tuple((url, size) for url, size in self.video_variants if url != self.video)
-            return [MediaItem("video", self.video, alternatives=spares)]
+            size = next((size for url, size in self.video_variants if url == self.video), 0)
+            return [MediaItem("video", self.video, alternatives=spares, size=size)]
         items: list[MediaItem] = []
         for index, photo in enumerate(self.photos):
             live = self.lives[index] if index < len(self.lives) else None

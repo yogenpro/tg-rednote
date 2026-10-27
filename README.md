@@ -227,6 +227,24 @@ the first message and no way to reach the rest. So every message but the last al
 sequence is sent — message ids can't be predicted — and the caption reserves room for one up
 front.
 
+Large videos use the same continuation flow. In `auto` and `upload` mode, videos
+larger than 20 MiB are split losslessly at keyframes into independently playable
+MP4 segments, each at most 20 MiB. Each segment is a separate `[1/n]`, `[2/n]`, …
+video post replying to the previous one; channel captions get the same
+`continues ↓` links, and description overflow rides later segments' captions.
+This also recovers videos whose smallest available rendition exceeds the
+50 MiB upload limit. A small known video keeps its normal URL/file-id path;
+explicit `url` mode continues to hand URLs to Telegram without local processing.
+
+The image includes FFmpeg/ffprobe. Sources are streamed to a private temporary
+directory, not held entirely in memory. Preparation is serialized and bounded
+to 500 MiB of sources per submission and 64 segments per video. Actual segment
+sizes and durations are checked before any segment is posted. A video that
+cannot be split safely fails and remains queued; it is never silently truncated
+or re-encoded. Temporary files are removed after success, failure or cancellation.
+Interrupted delivery can leave already-posted segments, as with a partially
+sent photo album; the publication index is updated only after complete delivery.
+
 Putting the extras into the channel's **linked discussion group** was tried first and reverted,
 for the same reason: a forwarded post loses its thread, so the reader can't reach them. The bot
 ignores linked discussion groups entirely, which is also why it never talks back to people

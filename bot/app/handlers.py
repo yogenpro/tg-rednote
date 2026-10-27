@@ -28,6 +28,7 @@ from .acres import looks_like_cookie as looks_like_acres_cookie
 from .cache import LRU
 from .config import Config
 from .logs import current_rid, fields, new_rid
+from .login import LoginClient, LoginFlow
 from .comments import (
     comment_albums,
     fit_into_caption,
@@ -70,6 +71,8 @@ OWNER_HELP = HELP + """
 /allow &lt;user_id&gt; · /deny &lt;user_id&gt; · /users
 /groups · /allowgroup &lt;chat_id&gt; · /denygroup &lt;chat_id&gt;
 /retry [n] — replay group submissions that failed, oldest first
+/login — sign in to XHS by scanning a QR in this private chat
+/login_cancel — cancel the pending QR login
 /acres &lt;cookie or curl&gt; · /forgetacres"""
 
 # Shown at the foot of a message that has a continuation. Kept short: it costs
@@ -193,6 +196,7 @@ class Bot:
         self.state = state
         self.tg = telegram
         self.xhs = downloader
+        self.login = LoginFlow(LoginClient(config.login_socket), telegram, self._save_login_cookie)
         self.notes: LRU[Note] = LRU(maxsize=config.cache_size, ttl=config.cache_ttl_seconds)
         self._told_owner_cookieless = False
         self.file_ids: LRU[str] = LRU(maxsize=512)
@@ -551,7 +555,20 @@ class Bot:
         if command == "/status":
             await self._handle_status(chat_id, user_id)
             return
+        if command in {"/login", "/login_cancel"}:
+            if user_id != self.state.owner_id:
+                await self._reply(chat_id, "Owner only.")
+            elif command == "/login_cancel":
+                await self.login.cancel()
+                await self._reply(chat_id, "QR login cancelled. The existing cookie was kept.")
+            else:
+                await self.login.start(chat_id)
+            return
         if command == "/forgetcookie":
+            if user_id != self.state.owner_id:
+                await self._reply(chat_id, "Owner only.")
+                return
+            await self.login.cancel()
             self.state.clear_cookie()
             self.xhs.set_cookie(None)
             await self._reply(chat_id, "Cookie wiped. Fetches will run unauthenticated.")
@@ -659,6 +676,10 @@ class Bot:
 
     # ---- cookie ------------------------------------------------------
 
+    def _save_login_cookie(self, cookie: str) -> None:
+        self.state.set_cookie(cookie)
+        self.xhs.set_cookie(cookie)
+
     async def _handle_cookie(self, chat_id: int, user_id: int, message_id: int | None, text: str) -> None:
         # Delete first: the value is on Telegram's servers until we do (PLAN §7).
         deleted = await self.tg.delete_message(chat_id, message_id) if message_id else False
@@ -676,6 +697,8 @@ class Bot:
             )
             return
 
+        # A pending QR must never overwrite a manual replacement later.
+        await self.login.cancel()
         self.state.set_cookie(value)
         self.xhs.set_cookie(value)
         warnings = []
@@ -1833,6 +1856,7 @@ class Bot:
             log.error("could not reply to %s: %s", chat_id, exc.description)
 
     async def aclose(self) -> None:
+        await self.login.cancel()
         await self.sender.aclose()
         if self.acres:
             await self.acres.aclose()

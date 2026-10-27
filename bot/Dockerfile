@@ -27,7 +27,8 @@ COPY app ./app
 # The state file holds the XHS cookie, so it lives on a volume owned by an
 # unprivileged user; the process itself is disposable (PLAN §5).
 RUN useradd --uid 10001 --create-home --shell /usr/sbin/nologin bot \
-    && mkdir -p /data && chown bot:bot /data
+    && mkdir -p /data /run/xhs-login && chown bot:bot /data /run/xhs-login \
+    && chmod 0700 /run/xhs-login
 USER bot
 VOLUME /data
 

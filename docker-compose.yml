@@ -77,6 +77,7 @@ services:
       # Holds the owner, allowlist, published index and the XHS cookie.
       # Back this up; losing it means re-pairing and re-adding the cookie.
       - bot-state:/data
+      - login-socket:/run/xhs-login
     depends_on:
       xhs-downloader:
         # The bot survives a missing sidecar, but starting in order means the
@@ -86,6 +87,30 @@ services:
     stop_grace_period: 60s
     logging: *logging
 
+  # Optional: docker compose --profile login up -d
+  # The browser has no bot token, state mount, TCP listener or host port. Only
+  # the bot shares its owner-only Unix socket. Never give it the bot's env_file.
+  xhs-login:
+    profiles: [login]
+    image: ghcr.io/yogenpro/tg-rednote-login:latest
+    restart: unless-stopped
+    init: true
+    user: "10001:10001"
+    environment:
+      PROXY: ${PROXY:-${XHS_PROXY:-}}
+    volumes:
+      - login-socket:/run/xhs-login
+    read_only: true
+    tmpfs:
+      - /tmp:rw,nosuid,nodev,size=256m,uid=10001,gid=10001,mode=700
+    shm_size: 128m
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    pids_limit: 256
+    mem_limit: 768m
+    logging: *logging
+
 volumes:
   bot-state:
   xhs-settings:
+  login-socket:

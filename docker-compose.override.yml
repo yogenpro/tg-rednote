@@ -25,3 +25,7 @@ services:
     # (say a `latest` pulled last week) silently stands in for your working
     # tree, and you debug code you did not write.
     pull_policy: build
+
+  xhs-login:
+    build: ./login
+    pull_policy: build

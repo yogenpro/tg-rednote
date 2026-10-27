@@ -38,6 +38,8 @@ class Config:
     # a wedged poller from a quiet one.
     heartbeat_path: Path = Path("/tmp/heartbeat")
     downloader_url: str = "http://xhs-downloader:5556"
+    # A private shared Unix socket, never a browser port or HTTP endpoint.
+    login_socket: str = "/run/xhs-login/login.sock"
 
     # Optional fully-scripted bootstrap (PLAN §7).
     owner_id: int | None = None
@@ -103,6 +105,7 @@ class Config:
             downloader_url=os.environ.get(
                 "XHS_DOWNLOADER_URL", "http://xhs-downloader:5556"
             ).rstrip("/"),
+            login_socket=os.environ.get("LOGIN_SOCKET", "/run/xhs-login/login.sock"),
             owner_id=int(owner_raw) if owner_raw else None,
             media_mode=_env_choice("MEDIA_MODE", "auto", {"auto", "url", "upload"}),
             live_photos=_env_choice("LIVE_PHOTOS", "still", {"still", "video", "both"}),

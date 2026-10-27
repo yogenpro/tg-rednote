@@ -31,6 +31,12 @@ account holders (PLAN §2.4).
 
 You need Docker with Compose v2.
 
+For owner-only QR sign-in, enable the optional browser helper with
+`docker compose --profile login up -d`, then send `/login` in the bot's private
+chat and scan with the Xiaohongshu app. `/login_cancel` cancels the attempt;
+manual `/cookie` import still works. See [QR cookie capture](login/README.md)
+for isolation, deployment requirements and verification limits.
+
 ---
 
 ## Quick start

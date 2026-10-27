@@ -6,6 +6,7 @@ import asyncio
 import base64
 import json
 import sys
+import types
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -64,6 +65,7 @@ async def until(predicate):
 @pytest.mark.parametrize("url,allowed", [
     ("https://www.xiaohongshu.com/explore", True),
     ("https://sns-webpic.xhscdn.com/a", True),
+    ("https://fe-s10.rednotecdn.com/login.js", True),
     ("https://www.rednote.com/explore", True),
     ("https://xiaohongshu.com.attacker.test", False),
     ("http://127.0.0.1/admin", False),
@@ -362,3 +364,74 @@ async def test_browser_reloads_and_checks_user_before_exporting_cookie():
     seen = []
     assert await browser.run(seen.append) == "web_session=confirmed"
     assert seen == [PNG] and page.reloads == 1 and page.checks == 2
+
+
+async def test_regional_browser_uses_dedicated_login_page_and_scrubs_inherited_secrets(monkeypatch):
+    launches, visits, routes, closed = [], [], {}, []
+
+    class Page:
+        url = ""
+
+        def set_default_timeout(self, timeout):
+            pass
+
+        async def goto(self, url, **kwargs):
+            visits.append(url)
+            self.url = "https://www.rednote.com/explore" if len(visits) == 1 else url
+
+    class Context:
+        async def route(self, pattern, callback):
+            routes["http"] = callback
+
+        async def route_web_socket(self, pattern, callback):
+            routes["websocket"] = callback
+
+        async def new_page(self):
+            return Page()
+
+    class Browser:
+        async def new_context(self, **kwargs):
+            assert kwargs == {"accept_downloads": False, "service_workers": "block"}
+            return Context()
+
+        async def close(self):
+            closed.append(True)
+
+    async def launch(**kwargs):
+        launches.append(kwargs)
+        return Browser()
+
+    @asynccontextmanager
+    async def playwright():
+        yield types.SimpleNamespace(chromium=types.SimpleNamespace(launch=launch))
+
+    monkeypatch.setitem(sys.modules, "playwright", types.ModuleType("playwright"))
+    module = types.ModuleType("playwright.async_api")
+    module.async_playwright = playwright
+    monkeypatch.setitem(sys.modules, "playwright.async_api", module)
+    monkeypatch.setenv("TG_BOT_TOKEN", "must-not-reach-browser")
+    monkeypatch.setenv("HTTP_PROXY", "http://must-not-leak.test")
+    async with BrowserLogin("http://intended.test:8888").open():
+        pass
+    assert visits == ["https://www.xiaohongshu.com/explore", "https://www.rednote.com/login"]
+    assert closed == [True]
+    assert launches[0]["proxy"]["server"] == "http://intended.test:8888"
+    assert set(launches[0]["env"]) <= {"PATH", "HOME", "LANG"}
+    assert "must-not" not in json.dumps(launches)
+
+    class Route:
+        def __init__(self, url):
+            self.request = types.SimpleNamespace(url=url)
+            self.result = ""
+
+        async def continue_(self):
+            self.result = "allowed"
+
+        async def abort(self):
+            self.result = "blocked"
+
+    for url, expected in [("https://fe-s10.rednotecdn.com/login.js", "allowed"),
+                          ("http://169.254.169.254/latest/meta-data", "blocked")]:
+        route = Route(url)
+        await routes["http"](route)
+        assert route.result == expected
